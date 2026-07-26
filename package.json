@@ -1,0 +1,43 @@
+{
+  "name": "@fitfak/database",
+  "version": "1.0.0",
+  "description": "Zero-dependency encrypted binary database engine for Node.js (part of the FITFAK stack)",
+  "main": "index.js",
+  "type": "commonjs",
+  "author": {
+    "email": "network@fitfak.net",
+    "name": "Aybars Yıldırım",
+    "url": "https://aybars.net.tr"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "files": [
+    "index.js",
+    "src/",
+    "test/"
+  ],
+  "keywords": [
+    "database",
+    "encrypted",
+    "binary",
+    "zero-dependency"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "test:basic": "node test/basic-usage.js",
+    "test:direct": "node test/direct-access-demo.js",
+    "test:mls": "node test/mls-key-provider-demo.js",
+    "test:crypto-offload": "node test/crypto-offload-demo.js",
+    "test:index-snapshot": "node test/index-snapshot-demo.js",
+    "test:range-query": "node test/range-query-demo.js",
+    "test:disk-backed-index": "node test/disk-backed-index-demo.js",
+    "test:object-store": "node test/object-store-demo.js",
+    "test:object-direct": "node test/object-store-direct-access-demo.js",
+    "test": "npm run test:basic && npm run test:direct && npm run test:mls && npm run test:crypto-offload && npm run test:index-snapshot && npm run test:range-query && npm run test:disk-backed-index && npm run test:object-store && npm run test:object-direct"
+  },
+  "dependencies": {}
+}
