@@ -26,6 +26,7 @@ const lazy = {
   get enrollmentService() { return require('./src/provisioning/enrollment-service'); },
   get enrollmentClient() { return require('./src/provisioning/enrollment-client'); },
   get attestor() { return require('./src/provisioning/attestor'); },
+  get idpAttestor() { return require('./src/provisioning/idp-attestor'); },
   get caBackend() { return require('./src/provisioning/ca-backend'); },
   get csrProvider() { return require('./src/provisioning/csr-provider'); },
 };
@@ -64,6 +65,7 @@ module.exports = {
   // ---- provisioning: who may enrol as what ---------------------------------------------------
   get createSharedSecretAttestor() { return lazy.attestor.createSharedSecretAttestor; },
   get createTokenAttestor() { return lazy.attestor.createTokenAttestor; },
+  get createIdpTokenAttestor() { return lazy.idpAttestor.createIdpTokenAttestor; },
   get createRenewalAttestor() { return lazy.attestor.createRenewalAttestor; },
   get createCompositeAttestor() { return lazy.attestor.createCompositeAttestor; },
   get generateEnrolmentSecret() { return lazy.attestor.generateEnrolmentSecret; },
