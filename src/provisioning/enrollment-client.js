@@ -233,6 +233,84 @@ async function enroll({
 }
 
 /**
+ * Reconnects with a certificate this service already holds, with no enrolment exchange.
+ *
+ * Without this, a restart is indistinguishable from a first run: the only way back onto the
+ * data plane is enroll(), which spends a bootstrap credential. That forces the credential to
+ * be multi-use and long-lived -- a permanent backdoor sitting next to the identity system --
+ * purely because the process might get restarted, which it will.
+ *
+ * With it, the bootstrap credential is genuinely single-use: it establishes the first
+ * certificate, resume() carries it across restarts, and reenroll() replaces it before expiry
+ * over mTLS. The secret is never needed again and can be removed from the environment.
+ *
+ * The stored certificate is checked for expiry before use. A certificate that has already
+ * expired cannot authenticate, and finding that out from a TLS alert several layers down is
+ * far harder to act on than being told here.
+ *
+ * @param {object}  opts
+ * @param {string}  opts.target
+ * @param {string}  opts.certPem
+ * @param {string}  opts.privateKeyPem
+ * @param {string[]}opts.chainPem
+ * @param {object}  opts.csrProvider   needed for renewal
+ * @returns {Promise<ManagedIdentity>}
+ */
+async function resume({
+  target, certPem, privateKeyPem, chainPem = [], csrProvider,
+  principal = null, roles = [], notAfter = null, renewAfter = null,
+  subject = null, altNames = [], clientOptions = {}, paths = {}, logger = null,
+}) {
+  if (!target) throw new Error('fitdb enrol: target is required');
+  if (!certPem || !privateKeyPem) throw new Error('fitdb enrol: resume needs certPem and privateKeyPem');
+  if (!csrProvider) throw new Error('fitdb enrol: resume needs a csrProvider so the identity can renew');
+
+  const routes = { ...DEFAULT_ENROLMENT_PATHS, ...paths };
+  const cert = new crypto.X509Certificate(certPem);
+  const expiresAt = new Date(cert.validTo).getTime();
+  if (!(expiresAt > Date.now())) {
+    throw new TrustError(
+      `fitdb enrol: the stored certificate expired at ${cert.validTo}; it cannot authenticate. `
+      + 'Enrol again with a fresh bootstrap credential.',
+    );
+  }
+
+  const credentials = {
+    key: privateKeyPem,
+    cert: [certPem, ...chainPem.slice(0, -1)].join(''),
+    ca: chainPem.join(''),
+    rejectUnauthorized: true,
+  };
+
+  const client = new GrpcClient(target, { ...clientOptions, credentials });
+  await client.connect();
+
+  const resolvedPrincipal = principal || cert.subject.match(/CN=([^\n,]+)/)?.[1] || null;
+  const enroller = {
+    reenroll: (identity) => reenroll({
+      identity, csrProvider, routes, subject: subject || { CN: resolvedPrincipal }, altNames, logger,
+    }),
+  };
+
+  logger?.info?.(`[enrol] resumed '${resolvedPrincipal}' from a stored certificate; no bootstrap credential used`);
+
+  return new ManagedIdentity({
+    client,
+    credentials,
+    certPem,
+    privateKeyPem,
+    chainPem,
+    principal: resolvedPrincipal,
+    roles: roles || [],
+    notAfter: Number(notAfter) || expiresAt,
+    // A stored renewAfter from a previous run stays valid; without one, fall back to two
+    // thirds of the remaining life rather than waiting until the certificate is nearly dead.
+    renewAfter: Number(renewAfter) || (Date.now() + Math.floor((expiresAt - Date.now()) * (2 / 3))),
+    enroller,
+  });
+}
+
+/**
  * Renewal over the already-authenticated channel. A fresh key pair is generated rather than
  * re-certifying the old one: if the previous key was ever exposed, renewing onto it would
  * carry the exposure forward for another full lifetime.
@@ -306,4 +384,4 @@ function normalizeFingerprint(value) {
   return String(value || '').replace(/:/g, '').toLowerCase();
 }
 
-module.exports = { enroll, reenroll, ManagedIdentity, TrustError, DEFAULT_ENROLMENT_PATHS };
+module.exports = { enroll, resume, reenroll, ManagedIdentity, TrustError, DEFAULT_ENROLMENT_PATHS };

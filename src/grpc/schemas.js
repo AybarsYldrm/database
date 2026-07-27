@@ -88,6 +88,10 @@ const DATABASE_SCHEMAS = {
     { no: 2, name: 'collection', type: 'string' },
     { no: 3, name: 'payloadJson', type: 'string' },
     { no: 4, name: 'payloadBin', type: 'bytes' },
+    // Fields that must not already hold this value in a live record. Checked and written as
+    // one atomic step, which the read-then-insert equivalent over a network round trip cannot
+    // be: two callers racing to certify the same key would both see "absent" and both insert.
+    { no: 5, name: 'uniqueFields', type: 'string', repeated: true },
   ],
   [`${DB}_InsertRecordRes`]: [{ no: 1, name: 'recordId', type: 'string' }],
 

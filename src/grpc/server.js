@@ -387,9 +387,18 @@ class DatabaseServer extends EventEmitter {
           requirePermission(database, principal, DB_PERMISSIONS.WRITE, 'insert');
           const collection = self._collection(database, req.collection);
           const record = self._read(collection, req);
+          const unique = Array.isArray(req.uniqueFields) ? req.uniqueFields.filter(Boolean) : [];
           try {
-            return { recordId: await collection.insert(record) };
+            const recordId = unique.length
+              ? await collection.insertUnique(record, { unique })
+              : await collection.insert(record);
+            return { recordId };
           } catch (err) {
+            // ALREADY_EXISTS rather than INVALID_ARGUMENT: the request was well formed, the
+            // state refused it. A caller retrying on INVALID_ARGUMENT would loop forever.
+            if (err.code === 'UNIQUE_CONSTRAINT') {
+              throw new GrpcError(GRPC_STATUS.ALREADY_EXISTS, err.message);
+            }
             throw new GrpcError(GRPC_STATUS.INVALID_ARGUMENT, err.message);
           }
         },

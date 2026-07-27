@@ -52,6 +52,23 @@ class RemoteCollection {
     return res.recordId;
   }
 
+  /**
+   * insert() that the server refuses if a live record already holds the same value in any of
+   * `unique`. Rejects with `code: 'ALREADY_EXISTS'`.
+   *
+   * The check happens inside the server's write queue, in the same step as the append. Doing
+   * it here -- findOne, then insert -- would be two round trips with the whole network between
+   * them, which is the widest possible window for a second caller to slip through.
+   *
+   *   await certs.insertUnique({ skidHex, ... }, { unique: ['skidHex'] });
+   */
+  async insertUnique(record, { unique } = {}) {
+    const fields = Array.isArray(unique) ? unique : [unique].filter(Boolean);
+    if (fields.length === 0) throw new Error('fitdb: insertUnique needs at least one field in `unique`');
+    const res = await this._call('InsertRecord', { payloadJson: toJson(record), uniqueFields: fields });
+    return res.recordId;
+  }
+
   async get(recordId) {
     const res = await this._call('GetRecord', { recordId: String(recordId) });
     return res.found ? JSON.parse(res.payloadJson) : null;

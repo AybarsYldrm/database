@@ -212,9 +212,30 @@ function createEnrollmentService({
 function assertIdentityMatchesGrant(parsedCsr, grant) {
   const requestedCn = parsedCsr.subject?.CN;
   const grantedCn = grant.subject?.CN;
-  if (grantedCn && requestedCn && requestedCn !== grantedCn) {
+
+  // Fail closed when the CN cannot be read.
+  //
+  // This guard used to be `if (grantedCn && requestedCn && ...)`, which meant a backend whose
+  // parseCsr did not decode a subject made the whole comparison evaporate -- no error, no
+  // warning, just an authorisation check that silently stopped running. The @fitfak/ssl
+  // backend was exactly that case, so a peer granted 'idp-service' could enrol a CSR naming
+  // any other principal and be certified as it. A check that no-ops when its input is missing
+  // is worse than no check at all, because it reads like protection.
+  if (grantedCn && requestedCn === undefined) {
+    throw new GrpcError(GRPC_STATUS.INTERNAL,
+      'the CA backend did not report a subject for this CSR, so the requested identity cannot be '
+      + 'checked against the grant; refusing to issue');
+  }
+  if (grantedCn && requestedCn !== grantedCn) {
     throw new GrpcError(GRPC_STATUS.PERMISSION_DENIED,
       `the request asks for CN='${requestedCn}' but this credential only authorises CN='${grantedCn}'`);
+  }
+
+  // A second CN would pass the equality test above on its first occurrence while a relying
+  // party that reads the last one sees something else entirely.
+  if (Array.isArray(parsedCsr.commonNames) && parsedCsr.commonNames.length > 1) {
+    throw new GrpcError(GRPC_STATUS.PERMISSION_DENIED,
+      'the certificate signing request carries more than one common name');
   }
 
   const allowed = new Set((grant.altNames || []).map(normalizeAltName));

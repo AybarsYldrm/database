@@ -94,6 +94,33 @@ class Collection {
     return String(rec._id);
   }
 
+  /**
+   * insert() that refuses if a live record already holds the same value in any of `unique`.
+   * The check and the write are one atomic step -- see CollectionStorage#putUnique for why
+   * the read-then-insert spelling of this does not hold under concurrency.
+   *
+   * Named fields must be indexed (`index: true` or `blindIndex: true`); a blind index is
+   * enough, since proving "no record has this exact value" is precisely the one question a
+   * blind index can answer.
+   *
+   *   await certs.insertUnique({ skidHex, serialNumberHex, ... }, { unique: ['skidHex'] });
+   *
+   * Throws UniqueConstraintError, which carries `.field` and `.value`.
+   */
+  async insertUnique(obj, { unique } = {}) {
+    if (!unique || (Array.isArray(unique) && unique.length === 0)) {
+      throw new Error('fitdb: insertUnique needs at least one field in `unique`');
+    }
+    this._validate(obj);
+    const rec = { ...obj };
+    if (rec._id === undefined || rec._id === null) {
+      if (!this._idGenerator) throw new Error('fitdb: no id generator wired and no _id supplied');
+      rec._id = this._idGenerator();
+    }
+    await this.storage.putUnique(rec, unique);
+    return String(rec._id);
+  }
+
   // Generates an id from the same shared Snowflake sequence insert() would use, without
   // inserting anything yet -- for callers (like FitObjectStore) that need to know the id
   // BEFORE writing a record, e.g. to derive a per-object key or a blob file path first.

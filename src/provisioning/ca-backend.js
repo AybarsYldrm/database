@@ -55,8 +55,17 @@ function createFitfakSslCaBackend({ ca, ssl = null, defaultValidityDays = 397 } 
 
     async parseCsr(csrPem) {
       const parsed = lib.parseCSR(csrPem);
+      const subject = subjectFromPairs(parsed.subject, lib);
+      // A CSR carrying two CN attributes would let the first one satisfy an RA's
+      // equality check while a relying party reads the second. `subjectAttrs`
+      // preserves DER order and every occurrence, so the count is checkable.
+      const commonNames = (parsed.subjectAttrs || [])
+        .filter(([oidHex]) => oidHex === '550403')
+        .map(([, value]) => value);
       return {
-        subject: subjectFromPairs(parsed.subject, lib),
+        subject,
+        subjectAttrs: parsed.subjectAttrs || null,
+        commonNames,
         altNames: (parsed.sans || parsed.altNames || []).map((s) => (typeof s === 'string' ? s : s.value)),
         publicKeyPem: parsed.publicKeyPem || null,
         // A CSR is self-signed by the key being certified; verifying that signature is the
@@ -67,8 +76,23 @@ function createFitfakSslCaBackend({ ca, ssl = null, defaultValidityDays = 397 } 
       };
     },
 
-    async issue({ csrPem, validityDays = defaultValidityDays }) {
-      const issued = lib.issueCertificateFromCSR(csrPem, ca.issuer || ca, { validityDays });
+    async issue({ csrPem, subject, validityDays = defaultValidityDays }) {
+      // The subject is taken from the GRANT, never from the CSR.
+      //
+      // By default @fitfak/ssl copies the CSR's own subject into the certificate, which is
+      // right when the requester and the named party are the same. Here they are not: this is
+      // a Registration Authority, so "who you are" comes from what the attestor authorised,
+      // not from what the applicant typed. Relying on an equality check between the two
+      // instead would make the whole identity boundary depend on that one comparison never
+      // being skipped -- and it was skipped, silently, for exactly as long as parseCSR
+      // returned no decoded subject at all.
+      const issued = lib.issueCertificateFromCSR(csrPem, ca.issuer || ca, {
+        validityDays,
+        ...(subject && Object.keys(subject).length ? { subjectOverride: subject } : {}),
+        // The CSR's SANs are kept rather than replaced by the grant's: enrolment has already
+        // checked they are a subset of what was granted, and issuing the full granted set to
+        // a peer that asked for less would widen the certificate beyond the request.
+      });
       const certPem = issued.pem || issued.certPem;
       return {
         certPem,

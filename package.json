@@ -45,8 +45,10 @@
     "test:grpc": "node test/grpc-bootstrap-demo.js",
     "test:secrets-dns": "node test/secret-and-dns-demo.js",
     "test:adapter-compat": "node test/adapter-compat-demo.js",
+    "test:identity-binding": "node test/enrolment-identity-binding-demo.js",
+    "test:bootstrap-resume": "node test/bootstrap-resume-demo.js",
     "test:engine": "npm run test:basic && npm run test:direct && npm run test:mls && npm run test:crypto-offload && npm run test:index-snapshot && npm run test:range-query && npm run test:disk-backed-index && npm run test:object-store && npm run test:object-direct && npm run test:schema",
-    "test": "npm run test:engine && npm run test:secrets-dns && npm run test:grpc && npm run test:adapter-compat",
+    "test": "npm run test:engine && npm run test:secrets-dns && npm run test:grpc && npm run test:adapter-compat && npm run test:identity-binding && npm run test:bootstrap-resume",
     "example:idp": "node examples/idp-bootstrap.js",
     "link:grpc": "node scripts/link-grpc.js",
     "test:schema": "node test/schema-migration-demo.js"
