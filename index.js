@@ -56,6 +56,7 @@ module.exports = {
   get createEnrollmentService() { return lazy.enrollmentService.createEnrollmentService; },
   get ENROLMENT_SCHEMAS() { return lazy.enrollmentService.ENROLMENT_SCHEMAS; },
   get enroll() { return lazy.enrollmentClient.enroll; },
+  get resume() { return lazy.enrollmentClient.resume; },
   get reenroll() { return lazy.enrollmentClient.reenroll; },
   get ManagedIdentity() { return lazy.enrollmentClient.ManagedIdentity; },
   get TrustError() { return lazy.enrollmentClient.TrustError; },
