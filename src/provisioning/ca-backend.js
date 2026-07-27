@@ -1,0 +1,198 @@
+'use strict';
+
+// Where certificates actually come from.
+//
+// This database server is NOT a certificate authority and must not become one. In this stack
+// the CA is central (the ACME authority at trust.fitfak.net) and the database plays the role
+// RFC 7030 calls a Registration Authority: it authenticates a peer that is not yet enrolled,
+// decides what identity that peer is allowed to be issued, and then asks the real CA to issue
+// it. Keeping issuance behind this interface is what makes that separation enforceable rather
+// than aspirational -- the enrolment service literally cannot sign anything itself.
+//
+// A backend implements:
+//
+//   async getTrustAnchors()  -> { chainPem: string[], fingerprints: string[] }
+//   async parseCsr(csrPem)   -> { subject: {CN,...}, altNames: string[], publicKeyPem, verified: boolean }
+//   async issue(request)     -> { certPem, chainPem: string[], notAfter: Date, serialNumber }
+//   async revoke?(serialNumber, reason)
+//
+// Three adapters ship here. All of them are thin: the PKI itself lives in @fitfak/ssl and in
+// the ACME authority, not in this package.
+
+const crypto = require('node:crypto');
+
+/**
+ * Adapter for @fitfak/ssl, for deployments that run their own CA in-process (the API mirrors
+ * that package's `CertificateAuthority` / `issueCertificateFromCSR` / `parseCSR` surface).
+ *
+ * The module is required lazily and by name so that @fitfak/database keeps installing with no
+ * dependencies for everyone who does not use this backend, and so that the failure -- if it
+ * is missing -- is a clear message at configuration time rather than a module-not-found
+ * during someone's first enrolment.
+ */
+function createFitfakSslCaBackend({ ca, ssl = null, defaultValidityDays = 397 } = {}) {
+  const lib = ssl || requireOptional('@fitfak/ssl',
+    'the @fitfak/ssl CA backend needs the @fitfak/ssl package installed, or an `ssl` module passed in');
+  if (!ca) throw new Error('fitdb pki: createFitfakSslCaBackend requires a `ca` (a @fitfak/ssl CertificateAuthority)');
+
+  const chain = () => {
+    const anchors = [];
+    if (typeof ca.getIntermediatePem === 'function') {
+      const intermediate = ca.getIntermediatePem();
+      if (intermediate) anchors.push(intermediate);
+    }
+    anchors.push(typeof ca.getRootPem === 'function' ? ca.getRootPem() : ca.certPem);
+    return anchors.filter(Boolean);
+  };
+
+  return {
+    name: '@fitfak/ssl',
+
+    async getTrustAnchors() {
+      const chainPem = chain();
+      return { chainPem, fingerprints: chainPem.map(fingerprintOf) };
+    },
+
+    async parseCsr(csrPem) {
+      const parsed = lib.parseCSR(csrPem);
+      return {
+        subject: subjectFromPairs(parsed.subject, lib),
+        altNames: (parsed.sans || parsed.altNames || []).map((s) => (typeof s === 'string' ? s : s.value)),
+        publicKeyPem: parsed.publicKeyPem || null,
+        // A CSR is self-signed by the key being certified; verifying that signature is the
+        // proof-of-possession step. Skipping it would let a caller request a certificate over
+        // someone else's public key.
+        verified: lib.verifyCSR(parsed) === true,
+        raw: parsed,
+      };
+    },
+
+    async issue({ csrPem, validityDays = defaultValidityDays }) {
+      const issued = lib.issueCertificateFromCSR(csrPem, ca.issuer || ca, { validityDays });
+      const certPem = issued.pem || issued.certPem;
+      return {
+        certPem,
+        chainPem: chain(),
+        notAfter: notAfterOf(certPem),
+        serialNumber: serialOf(certPem),
+      };
+    },
+
+    async revoke(serialNumber, reason = 0) {
+      if (typeof ca.revoke !== 'function') throw new Error('fitdb pki: this CA does not support revocation');
+      return ca.revoke(serialNumber, reason);
+    },
+  };
+}
+
+/**
+ * Adapter for the central ACME authority (RFC 8555). The ACME account, order and challenge
+ * dance lives in the caller's ACME client -- this only needs a function that takes a CSR and
+ * comes back with a certificate chain, which is exactly what `finalize` + `certificate`
+ * produce.
+ *
+ * Note what this implies operationally: ACME issues certificates for DNS identifiers it can
+ * validate, so an enrolling *service* identity (`idp.internal.fitfak.net`) has to be a name
+ * the authority will actually certify. For purely internal client identities that no public
+ * authority should ever vouch for, the @fitfak/ssl backend against a private CA is the right
+ * choice, and mixing the two -- public names for servers, a private CA for client identities
+ * -- is a perfectly normal split.
+ */
+function createAcmeCaBackend({ acme, trustAnchorsPem = [], defaultValidityDays = 90 } = {}) {
+  if (!acme || typeof acme.orderCertificate !== 'function') {
+    throw new Error('fitdb pki: createAcmeCaBackend requires an `acme` client exposing orderCertificate({ csrPem, identifiers })');
+  }
+  if (trustAnchorsPem.length === 0) {
+    // Without anchors the enrolling peer has nothing to pin the server to on its next
+    // connection, which quietly turns the upgraded mTLS channel back into trust-on-first-use.
+    throw new Error('fitdb pki: createAcmeCaBackend requires trustAnchorsPem so enrolled peers can validate the server');
+  }
+
+  return {
+    name: 'acme',
+
+    async getTrustAnchors() {
+      return { chainPem: trustAnchorsPem, fingerprints: trustAnchorsPem.map(fingerprintOf) };
+    },
+
+    async parseCsr(csrPem) {
+      if (!acme.parseCsr) throw new Error('fitdb pki: the ACME backend needs a parseCsr implementation to validate requested identities');
+      return acme.parseCsr(csrPem);
+    },
+
+    async issue({ csrPem, subject, altNames }) {
+      const identifiers = (altNames && altNames.length ? altNames : [subject?.CN]).filter(Boolean);
+      const result = await acme.orderCertificate({ csrPem, identifiers });
+      const chainPem = splitPemChain(result.certificatePem || result.certificate);
+      const certPem = chainPem.shift();
+      return {
+        certPem,
+        chainPem: chainPem.length ? chainPem : trustAnchorsPem,
+        notAfter: notAfterOf(certPem),
+        serialNumber: serialOf(certPem),
+        validityDays: defaultValidityDays,
+      };
+    },
+  };
+}
+
+/**
+ * Escape hatch: wrap any issuance function at all. Used by the test suite, and by anyone
+ * whose CA speaks a protocol neither adapter above covers (CMP, an internal HTTP API, a
+ * hardware appliance).
+ */
+function createCustomCaBackend({ name = 'custom', getTrustAnchors, parseCsr, issue, revoke = null }) {
+  if (typeof issue !== 'function') throw new Error('fitdb pki: createCustomCaBackend requires an `issue` function');
+  if (typeof getTrustAnchors !== 'function') throw new Error('fitdb pki: createCustomCaBackend requires a `getTrustAnchors` function');
+  if (typeof parseCsr !== 'function') throw new Error('fitdb pki: createCustomCaBackend requires a `parseCsr` function');
+  return { name, getTrustAnchors, parseCsr, issue, ...(revoke ? { revoke } : {}) };
+}
+
+// ---- helpers ---------------------------------------------------------------------------------
+
+function requireOptional(moduleName, message) {
+  try { return require(moduleName); }
+  catch (err) { throw new Error(`fitdb pki: ${message} (${err.message})`); }
+}
+
+function fingerprintOf(pem) {
+  return new crypto.X509Certificate(pem).fingerprint256;
+}
+
+function notAfterOf(pem) {
+  return new Date(new crypto.X509Certificate(pem).validTo);
+}
+
+function serialOf(pem) {
+  return new crypto.X509Certificate(pem).serialNumber;
+}
+
+function splitPemChain(pem) {
+  const matches = String(pem || '').match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----\n?/g);
+  return matches ? matches.map((m) => m.trim() + '\n') : [];
+}
+
+// @fitfak/ssl represents a subject as [[oid, value], ...]; everything else in this codebase
+// works with { CN, O, OU, ... }.
+const OID_TO_KEY = {
+  '2.5.4.3': 'CN', '2.5.4.6': 'C', '2.5.4.7': 'L', '2.5.4.8': 'ST', '2.5.4.10': 'O', '2.5.4.11': 'OU',
+};
+
+function subjectFromPairs(subject, lib) {
+  if (!subject) return {};
+  if (!Array.isArray(subject)) return subject;
+  const out = {};
+  for (const [oid, value] of subject) {
+    const key = OID_TO_KEY[oid] || (lib?.oid?.nameOf ? lib.oid.nameOf(oid) : oid);
+    out[key] = value;
+  }
+  return out;
+}
+
+module.exports = {
+  createFitfakSslCaBackend,
+  createAcmeCaBackend,
+  createCustomCaBackend,
+  splitPemChain,
+  fingerprintOf,
+};
