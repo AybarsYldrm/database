@@ -131,6 +131,42 @@ async function main() {
   check('the certificate says idp-service', /CN=idp-service/.test(imposedCert.subject));
   check('and carries no trace of the requested name', !/db-admin-service/.test(imposedCert.subject));
 
+  console.log('\n[8] The same key cannot be certified twice, even under a race');
+  // "One person can produce several certificates from the same CSR" is the same class of
+  // problem one layer down: whatever decides a key is fresh has to decide it atomically.
+  // The natural spelling -- findOne, then insert -- is two separate trips through the write
+  // queue, so concurrent callers all observe "absent" and all insert.
+  const { DatabaseManager, ClientSecretKeyProvider, SnowflakeGenerator, randomClientSecret } = require('../src');
+  const mgr = new DatabaseManager({ baseDir, snowflake: new SnowflakeGenerator({ workerId: 1 }) });
+  const { db } = await mgr.createDatabase({
+    ownerId: 'ra', name: 'ra', keyProvider: new ClientSecretKeyProvider(randomClientSecret()),
+  });
+  await db.defineCollectionAsync('certificates', {
+    fields: [
+      { no: 2, name: 'skidHex', type: 'string', index: true, required: true },
+      { no: 3, name: 'serialNumberHex', type: 'string' },
+    ],
+  });
+  const certs = db.collection('certificates');
+
+  const skid = 'deadbeefcafe';
+  const race = await Promise.allSettled(Array.from({ length: 20 }, (_, i) => (
+    certs.insertUnique({ skidHex: skid, serialNumberHex: `s${i}` }, { unique: ['skidHex'] })
+  )));
+  const accepted = race.filter((r) => r.status === 'fulfilled').length;
+  const duplicates = race.filter((r) => r.status === 'rejected' && r.reason.code === 'UNIQUE_CONSTRAINT').length;
+  check('exactly one of 20 concurrent issuances is accepted', accepted === 1);
+  check('the other 19 are refused as duplicates', duplicates === 19);
+  check('and only one record exists for that key', (await certs.find('skidHex', skid)).length === 1);
+
+  // Deleting the record must free the key again, or revoking a certificate would silently
+  // brick that key forever with nothing to point at as the cause.
+  const [existing] = await certs.find('skidHex', skid);
+  await certs.delete(existing._id);
+  const reissued = await certs.insertUnique({ skidHex: skid, serialNumberHex: 'after-delete' }, { unique: ['skidHex'] });
+  check('a deleted record frees the value again', !!reissued);
+
+  await db.close();
   await fsp.rm(baseDir, { recursive: true, force: true });
   console.log(`\nOK - enrolment identity binding: ${checks} checks passed.`);
 }

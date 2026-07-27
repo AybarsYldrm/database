@@ -12,7 +12,7 @@ const codec = require('./binary-codec');
 const crypto = require('./crypto-core');
 const { AsyncQueue } = require('./async-queue');
 const { SegmentedLRUCache } = require('./cache');
-const { CollectionStorage } = require('./storage-engine');
+const { CollectionStorage, UniqueConstraintError } = require('./storage-engine');
 const { Collection, Database, deriveCollectionKey, normalizeSchema } = require('./database');
 const { DatabaseManager } = require('./database-manager');
 const { ClientSecretKeyProvider, MlsExportSecretKeyProvider, StaticKeyProvider, randomClientSecret } = require('./key-provider');
@@ -37,7 +37,7 @@ module.exports = {
   codec, crypto,
   AsyncQueue,
   SegmentedLRUCache,
-  CollectionStorage,
+  CollectionStorage, UniqueConstraintError,
   Collection, Database, deriveCollectionKey, normalizeSchema,
   DatabaseManager,
   ClientSecretKeyProvider, MlsExportSecretKeyProvider, StaticKeyProvider, randomClientSecret,

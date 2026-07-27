@@ -41,6 +41,21 @@ function buildAad(idBuf, op, flags, version) {
 
 
 
+/**
+ * Raised when putUnique() finds a live record already holding the value. Carries the field and
+ * value so a caller can map it onto its own vocabulary -- the gRPC layer turns it into
+ * ALREADY_EXISTS, the IdP turns it into "this key has already been certified".
+ */
+class UniqueConstraintError extends Error {
+  constructor(field, value, message) {
+    super(message || `fitdb: duplicate value for unique field '${field}'`);
+    this.name = 'UniqueConstraintError';
+    this.code = 'UNIQUE_CONSTRAINT';
+    this.field = field;
+    this.value = value;
+  }
+}
+
 class CollectionStorage {
   constructor({ dir, ddk, schema, segmentMaxBytes = 16 * 1024 * 1024, compress = false, cache, maxOpenReadFds = 64, cryptoOffload = null, diskFlushThreshold = 2000, onChange = null }) {
     this.dir = dir;
@@ -615,25 +630,67 @@ class CollectionStorage {
   // ---- public CRUD ---------------------------------------------------------------------
 
   async put(obj) {
+    return this._writeQueue.run(() => this._putUnqueued(obj));
+  }
+
+  // The body of put(), with no queueing of its own, so a caller that has already entered the
+  // write queue (putUnique) can reuse it without deadlocking on the tail it is holding.
+  async _putUnqueued(obj) {
     const idStr = String(obj._id);
+    let oldDecoded = null;
+    const existing = this.index.get(idStr);
+    if (existing && !existing.deleted) oldDecoded = await this._readAt(idStr, existing);
+    const newVersion = (existing ? existing.version : 0) + 1;
+
+    const idBuf = idToBuf(idStr);
+    const plainBuf = encodeRecord(this.schema, obj);
+    const { payload, flags } = this._maybeCompress(plainBuf);
+    const aad = buildAad(idBuf, OP_PUT, flags, newVersion);
+    const enc = await this._encrypt(payload, aad);
+    const location = await this._appendFrame(OP_PUT, flags, idBuf, newVersion, enc);
+
+    this.index.set(idStr, { ...location, deleted: false });
+    await this._reconcileIndexes(idStr, oldDecoded, obj);
+    if (this.cache) this.cache.set(idStr, obj);
+    if (this.onChange) this.onChange({ op: OP_PUT, id: idStr, version: newVersion, record: obj });
+    return obj;
+  }
+
+  /**
+   * put() that first proves no live record already holds `obj[field]` for each named field,
+   * with the check and the append inside ONE queued task.
+   *
+   * The check-then-act version of this -- `if (await c.findOne(f, v)) throw; await c.insert(x)`
+   * -- is what callers write naturally, and it does not hold: the two awaits are separate
+   * queue entries, so two concurrent callers both observe "absent" and both insert. For a
+   * uniqueness rule that exists to stop the SAME key being certified twice, losing that race
+   * is the entire failure mode, and it is easiest to lose exactly when someone is trying.
+   *
+   * Every other mutation path also runs through `_writeQueue`, so nothing can land between
+   * the lookup and the append.
+   */
+  async putUnique(obj, uniqueFields) {
+    const fields = Array.isArray(uniqueFields) ? uniqueFields : [uniqueFields];
     return this._writeQueue.run(async () => {
-      let oldDecoded = null;
-      const existing = this.index.get(idStr);
-      if (existing && !existing.deleted) oldDecoded = await this._readAt(idStr, existing);
-      const newVersion = (existing ? existing.version : 0) + 1;
-
-      const idBuf = idToBuf(idStr);
-      const plainBuf = encodeRecord(this.schema, obj);
-      const { payload, flags } = this._maybeCompress(plainBuf);
-      const aad = buildAad(idBuf, OP_PUT, flags, newVersion);
-      const enc = await this._encrypt(payload, aad);
-      const location = await this._appendFrame(OP_PUT, flags, idBuf, newVersion, enc);
-
-      this.index.set(idStr, { ...location, deleted: false });
-      await this._reconcileIndexes(idStr, oldDecoded, obj);
-      if (this.cache) this.cache.set(idStr, obj);
-      if (this.onChange) this.onChange({ op: OP_PUT, id: idStr, version: newVersion, record: obj });
-      return obj;
+      for (const fieldName of fields) {
+        const value = obj[fieldName];
+        if (value === undefined || value === null || value === '') {
+          throw new UniqueConstraintError(fieldName, value,
+            `fitdb: unique field '${fieldName}' must have a value`);
+        }
+        const ids = await this.lookupIds(fieldName, value);
+        // A tombstoned id stays in the index, so "already used" has to mean "used by a record
+        // that is still live" -- otherwise deleting a certificate record would permanently
+        // burn its key with no way to observe why.
+        for (const id of ids || []) {
+          const loc = this.index.get(String(id));
+          if (loc && !loc.deleted) {
+            throw new UniqueConstraintError(fieldName, value,
+              `fitdb: a record with ${fieldName}='${value}' already exists`);
+          }
+        }
+      }
+      return this._putUnqueued(obj);
     });
   }
 
@@ -819,4 +876,7 @@ class CollectionStorage {
   }
 }
 
-module.exports = { CollectionStorage, idToBuf, bufToId, HEADER_SIZE, OP_PUT, OP_DELETE };
+module.exports = {
+  CollectionStorage, UniqueConstraintError,
+  idToBuf, bufToId, HEADER_SIZE, OP_PUT, OP_DELETE,
+};
