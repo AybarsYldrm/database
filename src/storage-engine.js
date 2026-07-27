@@ -42,7 +42,7 @@ function buildAad(idBuf, op, flags, version) {
 
 
 class CollectionStorage {
-  constructor({ dir, ddk, schema, segmentMaxBytes = 16 * 1024 * 1024, compress = false, cache, maxOpenReadFds = 64, cryptoOffload = null, diskFlushThreshold = 2000 }) {
+  constructor({ dir, ddk, schema, segmentMaxBytes = 16 * 1024 * 1024, compress = false, cache, maxOpenReadFds = 64, cryptoOffload = null, diskFlushThreshold = 2000, onChange = null }) {
     this.dir = dir;
     this.ddk = ddk;
     this.schema = schema; // array of {no,name,type,index?,blindIndex?,required?,diskBacked?}
@@ -51,6 +51,10 @@ class CollectionStorage {
     this.cache = cache;
     this.maxOpenReadFds = maxOpenReadFds;
     this.diskFlushThreshold = diskFlushThreshold; // memtable entries before a disk-backed field flushes
+    // Fired after a mutation is durable AND indexed, never before -- a subscriber must never
+    // be able to observe a change that a concurrent reader cannot yet see. Notification order
+    // matches write order because every mutation runs through the same AsyncQueue.
+    this.onChange = onChange;
     // Optional { pool: CryptoWorkerPool, thresholdBytes } -- see crypto-worker-pool.js for
     // why this is gated by size and off by default: worker-thread dispatch measurably LOSES
     // to inline main-thread AES-GCM for small records (fitdb's realistic case), and only
@@ -566,6 +570,7 @@ class CollectionStorage {
       this.index.set(idStr, { ...location, deleted: false });
       await this._reconcileIndexes(idStr, oldDecoded, obj);
       if (this.cache) this.cache.set(idStr, obj);
+      if (this.onChange) this.onChange({ op: OP_PUT, id: idStr, version: newVersion, record: obj });
       return obj;
     });
   }
@@ -613,6 +618,7 @@ class CollectionStorage {
       this.index.set(idStr, { ...location, deleted: true });
       await this._reconcileIndexes(idStr, oldDecoded, {});
       if (this.cache) this.cache.delete(idStr);
+      if (this.onChange) this.onChange({ op: OP_DELETE, id: idStr, version: newVersion, record: null });
       return true;
     });
   }

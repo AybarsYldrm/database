@@ -1,7 +1,7 @@
 {
   "name": "@fitfak/database",
-  "version": "1.0.0",
-  "description": "Zero-dependency encrypted binary database engine for Node.js (part of the FITFAK stack)",
+  "version": "2.0.0",
+  "description": "Encrypted binary database engine for Node.js with an mTLS gRPC server and client (part of the FITFAK stack)",
   "main": "index.js",
   "type": "commonjs",
   "author": {
@@ -22,6 +22,10 @@
     "database",
     "encrypted",
     "binary",
+    "grpc",
+    "mtls",
+    "dns",
+    "secrets",
     "zero-dependency"
   ],
   "publishConfig": {
@@ -37,7 +41,22 @@
     "test:disk-backed-index": "node test/disk-backed-index-demo.js",
     "test:object-store": "node test/object-store-demo.js",
     "test:object-direct": "node test/object-store-direct-access-demo.js",
-    "test": "npm run test:basic && npm run test:direct && npm run test:mls && npm run test:crypto-offload && npm run test:index-snapshot && npm run test:range-query && npm run test:disk-backed-index && npm run test:object-store && npm run test:object-direct"
+    "test:grpc": "node test/grpc-bootstrap-demo.js",
+    "test:secrets-dns": "node test/secret-and-dns-demo.js",
+    "test:adapter-compat": "node test/adapter-compat-demo.js",
+    "test:engine": "npm run test:basic && npm run test:direct && npm run test:mls && npm run test:crypto-offload && npm run test:index-snapshot && npm run test:range-query && npm run test:disk-backed-index && npm run test:object-store && npm run test:object-direct",
+    "test": "npm run test:engine && npm run test:secrets-dns && npm run test:grpc && npm run test:adapter-compat",
+    "example:idp": "node examples/idp-bootstrap.js"
   },
-  "dependencies": {}
+  "dependencies": {
+    "@fitfak/grpc": "^2.0.0"
+  },
+  "peerDependencies": {
+    "@fitfak/ssl": "*"
+  },
+  "peerDependenciesMeta": {
+    "@fitfak/ssl": {
+      "optional": true
+    }
+  }
 }

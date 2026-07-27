@@ -3,6 +3,10 @@
 const path = require('node:path');
 const { CollectionStorage } = require('./storage-engine');
 const { hkdf } = require('./crypto-core');
+const { ChangeHub, CHANGE_OPS } = require('./change-stream');
+
+const STORAGE_OP_PUT = 1; // mirrors OP_PUT/OP_DELETE in storage-engine.js
+
 
 const RESERVED_FIELD_NO = 1;
 const RESERVED_FIELD_NAME = '_id';
@@ -145,7 +149,7 @@ class Collection {
 }
 
 class Database {
-  constructor({ dbId, name, dir, ddk, acl, manifest, idGenerator, persistManifest }) {
+  constructor({ dbId, name, dir, ddk, acl, manifest, idGenerator, persistManifest, changeBacklogSize = 1024 }) {
     this.dbId = dbId;
     this.name = name;
     this.dir = dir;
@@ -153,11 +157,25 @@ class Database {
     this.acl = acl;
     this.manifest = manifest; // { collections: { [name]: { fields, options } }, ... }
     this._idGenerator = idGenerator;
+    // One hub per database, not per collection: a watcher that cares about several
+    // collections (or all of them) needs a single ordered sequence across them, otherwise
+    // "resume from seq N" is ambiguous about which stream N belongs to.
+    this.changes = new ChangeHub({ backlogSize: changeBacklogSize });
     // Called with the current manifest whenever collection/ACL metadata changes, so a
     // schema defined after createDatabase() is not silently lost to the next reopen (the
     // manifest on disk is otherwise a point-in-time snapshot from creation time only).
     this._persistManifest = persistManifest || (async () => {});
     this.collections = new Map();
+  }
+
+  // Adapts the storage engine's numeric op code into the hub's stable string vocabulary, so
+  // a subscriber never has to know the on-disk frame format to read a change event.
+  _changeSink(collectionName) {
+    return ({ op, id, version, record }) => this.changes.publish({
+      collection: collectionName,
+      op: op === STORAGE_OP_PUT ? CHANGE_OPS.PUT : CHANGE_OPS.DELETE,
+      id, version, record,
+    });
   }
 
   async _openExistingCollections() {
@@ -168,6 +186,7 @@ class Database {
         schema: normalizeSchema(def.fields),
         segmentMaxBytes: def.options?.segmentMaxBytes,
         compress: def.options?.compress,
+        onChange: this._changeSink(name),
       });
       await storage.open();
       this.collections.set(name, new Collection(name, storage.schema, storage, { idGenerator: this._idGenerator, title: def.title, description: def.description }));
@@ -189,6 +208,7 @@ class Database {
       schema,
       segmentMaxBytes,
       compress,
+      onChange: this._changeSink(name),
     });
     // open() is async but collection creation is synchronous in the public API for
     // ergonomics; callers that need the open (AND the manifest update below) to have fully
@@ -215,8 +235,32 @@ class Database {
 
   listCollections() { return [...this.collections.keys()]; }
 
+  // Push-based alternative to polling. `collection` may be '*' to watch the whole database.
+  // Returns an unsubscribe function; see change-stream.js for the resume/gap semantics that
+  // make a subscriber's cached view safe to serve from.
+  watch(collection, handler) { return this.changes.subscribe(collection, handler); }
+
+  // A consistent starting point for a watcher: the full current contents of a collection
+  // plus the sequence numbers those contents correspond to.
+  //
+  // The counters are read BEFORE the scan, not after, and that ordering is the whole
+  // correctness argument. Reading after would let a write that landed mid-scan be both
+  // missed by the scan (if it targeted an already-visited position) and covered by the
+  // returned counter -- the watcher would then discard its event as "already applied" and
+  // silently serve a view missing that record forever. Reading first can only cause the
+  // opposite, harmless case: an event that re-applies something the snapshot already has.
+  async snapshot(collectionName) {
+    const collection = this.collection(collectionName);
+    const lastSeq = this.changes.lastSeq;
+    const lastCollSeq = this.changes.lastCollSeq(collectionName);
+    const records = [];
+    for await (const rec of collection.scan()) records.push(rec);
+    return { records, lastSeq, lastCollSeq };
+  }
+
   async close() {
     for (const c of this.collections.values()) await c.storage.close();
+    this.changes.clear();
   }
 }
 

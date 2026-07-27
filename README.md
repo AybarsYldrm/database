@@ -1,366 +1,464 @@
-# fitdb
+# @fitfak/database
 
-A from-scratch, zero-npm-dependency, encrypted, binary-storage database engine for Node.js.
-Every module under `lib/` uses only Node built-ins (`node:crypto`, `node:fs`, `node:zlib`,
-`node:net`, `node:tls`, `node:events`).
+An encrypted, binary-storage database engine for Node.js, plus an mTLS gRPC server and client
+for reaching it across a network. The engine itself uses only Node built-ins; the transport
+layer uses `@fitfak/grpc`, which does too.
+
+Three layers, each usable on its own:
 
 ```
-lib/
-  snowflake.js          Snowflake ID generator (also used for db ids, capability jti)
-  rbac.js                Bitmask permissions + per-database AccessControlList
-  async-queue.js         Serializes writes per collection (no interleaved appends)
-  crypto-core.js          HKDF/AES-256-GCM/blind-index primitives
-  key-provider.js         Pluggable KEK sources: ClientSecretKeyProvider, MlsExportSecretKeyProvider
-  crypto-worker-pool.js   Size-gated worker_threads AES-GCM offload (measured, opt-in, off by default)
-  binary-codec.js         Schema-driven TLV encoder/decoder (the "more efficient than JSON" layer)
-  index-value-codec.js    Shared tagged key codec (snapshot Maps + on-disk sorted segments)
-  id-codec.js             Shared id<->8-byte-buffer codec
-  cache.js                Segmented LRU (probationary/protected) record cache
-  sorted-index-segment.js Real disk-backed sorted structure (SSTable-style: sparse RAM index + on-disk blocks)
-  secondary-index-store.js  Bounded-memory memtable+tombstones wrapper around a sorted segment
-  storage-engine.js       Encrypted append-only segments, primary+secondary+blind+range indexes, compaction
+src/                    the engine — encrypted append-only storage, indexes, object store
+src/grpc/               DatabaseService: server and client, mTLS-authenticated
+src/provisioning/       how a service with no certificate gets one
+```
+
+`require('@fitfak/database')` in a CLI tool does not drag in an HTTP/2 server — the transport
+and provisioning modules load on first use.
+
+```
+src/
+  snowflake.js            Snowflake ID generator (db ids, record ids, capability jti)
+  rbac.js                 Bitmask permissions + per-database AccessControlList
+  async-queue.js          Serializes writes per collection
+  crypto-core.js          HKDF / AES-256-GCM / blind-index primitives
+  key-provider.js         Pluggable KEK sources: ClientSecret, MLS export secret
+  crypto-worker-pool.js   Size-gated worker_threads AES-GCM offload (measured, off by default)
+  binary-codec.js         Schema-driven TLV codec — the "smaller than JSON" layer
+  cache.js                Segmented LRU record cache
+  sorted-index-segment.js SSTable-style on-disk sorted index
+  secondary-index-store.js Bounded-memory memtable + tombstones over that segment
+  storage-engine.js       Encrypted segments, primary/secondary/blind/range indexes, compaction
+  change-stream.js        Ordered change events with gap detection — the alternative to polling
   version-watermark.js    Client-side rollback/replay detection
-  database.js             Collection/Database, per-collection HKDF subkeys, findRange/findRangePlain
-  database-manager.js     create/open/close database, manifest, session cache, key rewrap
-  capability-token.js     kid+HMAC scoped, single-use, short-lived, row-filterable tokens
-  direct-protocol.js      Wire framing (v2: multiplexed, requestId-correlated) for direct access
-  direct-server.js        TCP/TLS listener authenticated purely by capability token, SCAN/cursor, object streaming
-  encrypted-blob.js       Chunked AEAD encryption for large private object bytes (true streaming)
-  object-store.js         FitObjectStore: S3-bucket-style file storage integrated with fitdb
-  object-http-server.js   Real HTTP server for public objects (S3 URL pattern)
-  index.js                barrel export
-examples/
-  basic-usage.js                    CRUD, indexing, persistence, compaction, crash recovery
-  direct-access-demo.js             multiplexed capability-token access, SCAN, row-scoped tokens
-  mls-key-provider-demo.js          pluggable KeyProvider + O(1) MLS-style key rotation
-  crypto-offload-demo.js            size-gated worker-pool crypto offload, verified on/off boundary
-  index-snapshot-demo.js            persisted secondary/blind index snapshot, measured vs full rebuild
-  range-query-demo.js               bucketized range queries, boundary correctness, persistence
-  disk-backed-index-demo.js         real disk-backed index: bounded memory (measured), flush/merge correctness
-  object-store-demo.js              public/private objects, RBAC, ownerId listing, exact-name blind lookup
-  object-store-direct-access-demo.js  public HTTP URL serving + private capability-token gRPC-style streaming
-  grpc-integration-sketch.js        illustrative-only wiring into the existing gRPC layer
+  database.js             Collection/Database, per-collection subkeys, watch(), snapshot()
+  database-manager.js     create/open/close, manifest, session cache, O(1) key rewrap
+  capability-token.js     kid+HMAC scoped, single-use, row-filterable tokens
+  direct-protocol.js      Multiplexed wire framing for capability-token direct access
+  direct-server.js        TCP/TLS listener authenticated purely by capability token
+  encrypted-blob.js       Chunked AEAD for large object bytes (true streaming)
+  object-store.js         S3-bucket-style file storage integrated with the engine
+  object-http-server.js   HTTP server for public objects
+  secret-store.js         Certificates, keys and tokens — versioned, expiry-queryable
+  dns-store.js            Authoritative DNS zones + an always-current in-memory ZoneCache
+  grpc/
+    schemas.js            Wire schemas for DatabaseService
+    server.js             DatabaseServer — every method mTLS-gated
+    client.js             connectDatabase, RemoteCollection, WatchedCollection
+    identity.js           client certificate → principal → per-database ACL
+    record-codec.js       JSON/TLV payloads, int64-safe
+  provisioning/
+    enrollment-service.js Registration Authority: bootstrap and renewal endpoints
+    enrollment-client.js  enrol → upgrade to mTLS → auto-renew
+    attestor.js           who may enrol as what (pluggable per service)
+    ca-backend.js         where certificates come from (@fitfak/ssl, ACME, custom)
+    csr-provider.js       key generation and CSR construction
 ```
 
-Run `npm test` (or any `node examples/*.js` individually) -- every file under `examples/` is an
-executable self-check, not just an illustration.
+`npm test` runs eleven suites. Every file under `test/` is an executable self-check.
 
 ---
 
-## 1. Key hierarchy
+## 1. Getting a client connected
+
+The central question this package answers is not "how do I query the database" but "how does a
+service that has never run before get permission to". The data plane is mTLS-only, so a
+service needs a client certificate — and it cannot have one until something has vouched for
+it.
+
+```
+  1. bootstrap TLS      server proves who it is; client proves nothing yet
+  2. fetch anchors      the CA bundle, so the client can verify the server from now on
+  3. enrol              prove entitlement, submit a CSR, receive a certificate
+  4. upgrade            same client object, now mutually authenticated
+  5. steady state       everything else, mTLS only
+  6. renew              over mTLS, well before expiry — no bootstrap credential involved
+```
+
+That is RFC 7030 (EST) semantics carried over gRPC. In this stack the CA is central (the ACME
+authority at `trust.fitfak.net`), and **this server is a Registration Authority, never a CA**:
+it authenticates the bootstrapping peer and decides what identity it may hold, then delegates
+the signature. It holds no signing key.
+
+### Client side
+
+```js
+const { enroll, connectDatabase, createFitfakSslCsrProvider } = require('@fitfak/database');
+
+const identity = await enroll({
+  target: 'https://db.internal.fitfak.net:8443',
+  serviceName: 'idp-service',
+  csrProvider: createFitfakSslCsrProvider(),
+  trust: { pinnedFingerprints: [process.env.DB_CA_FINGERPRINT] },
+  bootstrap: { secret: Buffer.from(process.env.ENROLMENT_SECRET, 'base64') },
+  altNames: ['idp.internal.fitfak.net'],
+});
+
+identity.startAutoRenewal();          // renews at ~2/3 of the certificate's lifetime
+const handle = await connectDatabase({ target, identity });
+```
+
+`identity.client` is already upgraded to mTLS. Renewal generates a **fresh key pair** rather
+than re-certifying the old one: renewing onto the same key would carry any past exposure
+forward for another full lifetime.
+
+### Server side
+
+```js
+const { createDatabaseServer, createSharedSecretAttestor, createRenewalAttestor,
+        createCompositeAttestor, createAcmeCaBackend } = require('@fitfak/database');
+
+const server = createDatabaseServer({
+  baseDir: '/var/lib/fitdb',
+  principals: {
+    'idp-service':  { roles: ['admin'] },
+    'dns-resolver': { roles: ['reader'] },
+  },
+  enrollment: {
+    caBackend: createAcmeCaBackend({ acme, trustAnchorsPem: [caPem] }),
+    attestor: createCompositeAttestor([
+      createSharedSecretAttestor({ enrolments: { 'idp-service': { secret, roles: ['admin'] } } }),
+      createRenewalAttestor(),
+    ]),
+  },
+});
+
+server.listen(8443, { tls: { key, cert, ca, requestCert: true, rejectUnauthorized: false } });
+```
+
+`requestCert: true, rejectUnauthorized: false` is what lets one port serve both channels: every
+client is asked for a certificate, a client without one still completes the handshake, and the
+per-method security level does the rest. Enrolment declares `minSecurityLevel: 'tls'`; every
+`DatabaseService` method declares `'mtls'`. The transport enforces this **before** the handler
+runs, so it cannot be forgotten in a handler.
+
+### The three ways to trust the server on first contact
+
+Until a peer has a certificate it cannot authenticate itself, but it must still authenticate
+the server it is about to hand an enrolment credential to. `enroll()` refuses to proceed
+without one of:
+
+| `trust` | What it means |
+|---|---|
+| `{ caPem }` | The CA bundle was delivered out of band. Verified during the handshake. Preferred. |
+| `{ pinnedFingerprints }` | Verified immediately after connect, against the leaf **or** a trust anchor. Pinning the CA survives a legitimate server-certificate rotation; pinning the leaf does not. |
+| `{ trustOnFirstUse: true }` | Explicitly accepting an unverified first connection. Logged loudly. |
+
+Trust anchors are fetched before verification completes — they are public data and the request
+carries no credential. **Nothing secret is sent until verification has settled.**
+
+### What the enrolment proof binds to
+
+```
+HMAC(secret, "fitdb-enroll-v1" ‖ serviceName ‖ nonce ‖ timestamp ‖ channelBinding ‖ SHA256(csr))
+```
+
+Each element closes a specific hole:
+
+- **`channelBinding`** — the RFC 9266 `tls-exporter` value. Without it, anyone who can observe
+  the bootstrap exchange, including a proxy that terminates TLS, can replay the proof on their
+  own connection. The test suite demonstrates the relay being rejected.
+- **`SHA256(csr)`** — without it, an interceptor can keep a valid proof and substitute a CSR
+  over a key they control, and the CA will certify the attacker's key under the victim's name.
+- **`nonce`** — burned unconditionally, whether or not the enrolment succeeds.
+- **`timestamp`** — bounds how long a captured proof stays useful.
+
+A bootstrap credential is **single-use by default**; renewal goes through the mTLS path, which
+needs no secret at all. A use is spent only once a certificate has actually been issued — an
+authenticated request rejected downstream (wrong CN, CA unreachable) leaves the credential
+usable, so a recoverable mistake does not become a re-provisioning job.
+
+The CSR is checked against the grant on **both** CN and SAN. Checking only the CN would leave
+the field most TLS stacks actually match on unchecked.
+
+### Other services, other mechanisms
+
+`createSharedSecretAttestor` is the bootstrap case. Once an IdP exists, `createTokenAttestor`
+delegates the decision to it; a device might present a TPM attestation; a workload might
+present a platform token. `createCompositeAttestor` runs several, so one endpoint serves a
+bootstrapping IdP, an IdP-issued workload token and an ordinary renewal.
+
+---
+
+## 2. Using the database
+
+The remote API mirrors the embedded one, so code moves between them by changing how the handle
+is obtained and nothing else.
+
+```js
+const db = await handle.openDatabase({ dbId, clientSecret });
+
+await db.defineCollection('kullanicilar', {
+  fields: [
+    { no: 2, name: 'email',    type: 'string', blindIndex: true, required: true },
+    { no: 3, name: 'tenant',   type: 'string', index: true },
+    { no: 4, name: 'createdAt', type: 'int64', rangeBucket: { width: 86400000 }, diskBacked: true },
+  ],
+});
+
+const users = db.collection('kullanicilar');
+const id = await users.insert({ email: 'a@fitfak.net', tenant: 'core', createdAt: Date.now() });
+await users.findOne('email', 'a@fitfak.net');
+await users.findRange('createdAt', weekAgo, now);
+for await (const record of users.scan()) { /* pages transparently */ }
+```
+
+`clientSecret` is returned by `CreateDatabase` exactly once and is never persisted
+server-side. Losing it means losing the data.
+
+**int64 and ids.** JSON has no int64, and every Snowflake id is above 2^53, so `JSON.parse`
+would silently round them — insert a record, read it back, get a *different id*. Ids and int64
+fields therefore cross the wire as strings and are coerced back by schema type. A JSON number
+that has already lost precision is rejected rather than stored corrupted.
+
+**Optimistic concurrency.** `update(id, patch, { expectedVersion })` returns `ABORTED` if the
+record moved. Without it, two concurrent read-modify-write callers silently lose one write.
+
+**Binary payloads.** After `describe()`, a client can send `payloadBin` — the collection's own
+TLV encoding — instead of `payloadJson`: same method, roughly 2.5x less on the wire.
+
+### Existing clients
+
+`DatabaseService` is wire-compatible with the hand-written schema map already deployed in the
+IdP's `grpc-db-adapter`: `OpenDatabase`, `InsertRecord`, `UpdateRecord`, `DeleteRecord` and
+`FindRecord` keep their field numbers, and the fields added since (`collections`,
+`sessionExpiresAt`, `payloadBin`, `expectedVersion`) sit at numbers that adapter does not
+declare, so proto3 skips them. `find('_id', id)` and `find('*', '')` are special-cased so the
+adapter's `get()` and `scan()` work unchanged. `test/adapter-compat-demo.js` pins this by
+running that adapter's exact schema map against the server.
+
+The one change an existing adapter does need is transport-level: the data plane is mTLS-only,
+so `{ rejectUnauthorized: false }` with no client certificate is no longer sufficient. Pass
+real credentials, or enrol for them.
+
+---
+
+## 3. Not polling
+
+Two workloads motivated the change stream, and both are unworkable with per-read decryption:
+
+- **DNS**, answered at query rate. Every answer would be a round trip plus a decrypt, for data
+  that changed hours ago.
+- **Certificates and keys**, where a stale cache means a service is still presenting a
+  certificate that was rotated away.
+
+```js
+const view = users.watch();
+await view.ready();
+
+view.get(id);     // map lookup, no network, no decrypt
+view.all();
+view.fresh;       // false when the stream reported a gap
+```
+
+Correctness rests on two things the server provides. Every event carries a **per-collection**
+sequence number as well as a global one — a watcher following one collection must check
+contiguity on the per-collection counter, because writes to *other* collections consume global
+numbers and would look like gaps. And when the server can no longer prove continuity it sends
+an explicit **RESET** rather than a stream with a hole in it.
+
+`Database#snapshot()` reads its sequence counters **before** scanning, not after. Reading after
+would let a write that landed mid-scan be both missed by the scan and covered by the returned
+counter — the watcher would discard its event as already-applied and serve a view missing that
+record forever. Reading first can only cause the harmless opposite: a re-applied change.
+
+Reconnection uses full jitter. A fixed retry interval turns a server restart into a
+synchronised stampede from every watcher at once.
+
+---
+
+## 4. Secrets: certificates and keys
+
+```js
+const vault = await SecretStore.open(db);
+
+await vault.putCertificate({ name: 'api.fitfak.net', certPem, privateKeyPem, chainPem });
+const pair = await vault.getCertificatePair('api.fitfak.net');   // ready for a TLS context
+
+await vault.listExpiring(30 * 86400000);   // what needs renewing
+```
+
+A private key written into a collection is encrypted at rest with the same construction as
+every other record — a copy of the data directory is useless without the root secret. A PEM
+file in `/etc` is not. **This is not an HSM**: material is decrypted into process memory
+whenever it is read, exactly like every other record. If the threat model includes a memory
+dump of a live process, the answer is a TPM/HSM-backed signer that never releases the key,
+not a different database.
+
+Expiry and fingerprint are read out of the certificate rather than taken from the caller — an
+expiry sweep that depends on a caller remembering to pass `notAfter` is a sweep that misses
+things.
+
+**Rotation is a transition, not a cutover.** Versions are never overwritten. A new version can
+be staged as `PENDING` and promoted later; the superseded version is `RETIRED`, not deleted, so
+a consumer that has not yet reloaded still has something real to verify against.
+`markCompromised()` marks and records a reason but does **not** erase — incident response needs
+to know what was exposed — and it is the local half of a revocation only; revoking at the CA
+is the CA's job.
+
+Browsing goes through `kind` (a plain index), never through `name` (blind-indexed). That
+asymmetry is deliberate: the set of secret *kinds* in use is not sensitive, the set of secret
+*names* is.
+
+---
+
+## 5. DNS
+
+```js
+const dns = await DnsStore.open(db);
+await dns.put({ zone: 'internal.fitfak.net', name: 'db.internal.fitfak.net',
+                type: 'A', ttl: 300, rdata: { address: '10.0.0.10' } });
+
+const cache = await dns.zoneCache('internal.fitfak.net');
+cache.query('anything.apps.internal.fitfak.net', 'A');
+// → { status: 'NOERROR', records: [...], chain: [] }
+```
+
+`resolve()` does an exact `(name, type)` lookup through the blind index — correct, but one
+decrypt per call. `zoneCache()` is the intended way to serve traffic: one snapshot, then the
+change stream.
+
+Everything a resolver needs that a blind index *cannot* provide happens against the decrypted
+zone, because all of it requires knowing what is **absent**, and an index that cannot enumerate
+can never establish absence:
+
+- **NODATA vs NXDOMAIN.** A missing type at an existing name is `NOERROR` with no records.
+  Answering `NXDOMAIN` there tells the world the name does not exist and breaks every other
+  type at it.
+- **Wildcards**, per RFC 4592 §3.3.1 via the closest encloser. `*.apps.example.com` answers for
+  `a.b.apps.example.com` — at any depth, not just one label — *unless* something between them
+  exists as a node. Given a real `sub.apps.example.com`, a query for `x.sub.apps.example.com`
+  is `NXDOMAIN`, not the wildcard's address. The naive "walk up trying `*.<suffix>`" version
+  gets this wrong, and getting it wrong means a wildcard silently capturing traffic meant for a
+  real subtree. Empty non-terminals are tracked for exactly this reason.
+- **CNAME chains**, including referrals out of the zone.
+
+`putRRset()` replaces a record set wholesale, which is the only way to avoid leaving a stale
+member in a round-robin A set. A record outside its zone is refused rather than stored: it
+would be present in the database, absent from DNS, and very hard to notice.
+
+`cache.fresh` is load-bearing. When the change stream reports a gap the cache stops claiming to
+be authoritative, and a resolver should answer SERVFAIL rather than serve a set it can no
+longer vouch for.
+
+---
+
+## 6. Identity and authorization
+
+The client certificate **is** the identity. `createPrincipalResolver` maps it to a principal;
+the per-database ACL decides what that principal may do. Certificates and grants are separate
+on purpose — adding a service should not require re-issuing anyone's certificate.
+
+```js
+createPrincipalResolver({
+  subjectField: 'CN',
+  principals: { 'idp-service': { roles: ['admin'] } },   // also the allow-list
+  pinnedIssuers: ['fitfak Issuing CA'],
+})
+```
+
+**Verified vs. presented certificates.** On a listener that accepts unauthenticated clients, a
+peer can present a certificate signed by any CA — including its own — and Node returns it from
+`getPeerCertificate()` exactly as it returns a valid one. `call.peer.certificate` is populated
+**only** when the chain validated, so a handler reading `commonName` from it can never get an
+attacker-chosen string. The unverified form is available as `peer.presentedCertificate`, under
+a name that cannot be mistaken for a trusted one.
+
+**Revocation at this layer is the allow-list.** Removing a principal locks that certificate out
+on its next connection however long it stays cryptographically valid. That is a real mechanism
+for a closed set of known services and an inadequate one for anything larger, where the CA's
+own CRL/OCSP infrastructure is what you want in front of this.
+
+Capability tokens still work for the direct-access path and may only ever **narrow** authority:
+a token wider than the issuer's own grant is refused, so `ISSUE_CAPABILITY` is a delegation
+primitive rather than an escalation one.
+
+---
+
+## 7. Key hierarchy
 
 ```
 root secret                         (clientSecret, OR an MLS group's exportSecret())
   --KeyProvider.deriveKek()-->      KEK
     --HKDF(KEK, 'fitdb-manifest')-> manifestKey    (decrypts manifest.bin: schema + ACL + wrappedDDK)
     --AES-256-GCM unwrap(KEK)-->    DDK             (Database Data Key, 32 random bytes)
-      --HKDF(DDK, 'collection:X')-> per-collection key   (encrypts every record in collection X)
+      --HKDF(DDK, 'collection:X')-> per-collection key
         --HKDF(DDK,'blind:field')-> per-field blind-index key (HMAC only, never encrypts)
 ```
 
-The server persists **only** `wrappedDDK`. Nobody can derive `manifestKey` or unwrap `DDK`
-without first being able to derive `KEK`, and `KEK` derivation is delegated entirely to a
-`KeyProvider` the storage/database layers never see the internals of. This is what makes
-key management swappable without touching storage: `ClientSecretKeyProvider` (a single
-32-byte secret, handed out once, for a single-operator database) and
-`MlsExportSecretKeyProvider` (an adapter around an existing RFC 9420 MLS group's
-`exportSecret()`, for genuinely multi-party databases) both just need to return 32 bytes.
+The server persists **only** `wrappedDDK`. KEK derivation is delegated entirely to a
+`KeyProvider` the storage layer never sees the internals of, which is what lets key management
+evolve without touching storage: `ClientSecretKeyProvider` for a single credential-holder,
+`MlsExportSecretKeyProvider` for an RFC 9420 group. `rewrapDatabaseKey()` gives O(1) rotation —
+re-wrap the same DDK under a new KEK, zero record I/O.
 
-**Honest caveat:** "the server cannot decrypt" is true of data *at rest* -- a copy of the
-disk, or of `manifest.bin` + segment files, is useless without the root secret. During a
-*live, authenticated session*, the DDK necessarily sits in RAM for as long as the session
-cache TTL (`DatabaseManager`'s `sessionTtlMs`, default 15 min) so the engine can actually
-encode/decode/index records. That is an inherent property of any queryable (as opposed to
-purely blind-blob) encrypted store, not a gap specific to this design -- a memory dump of a
-live process during an active session is a different threat than disk theft, and this
-system does not claim to defend against the former.
+**Honest caveat.** "The server cannot decrypt" is true of data *at rest*: a copy of the disk is
+useless without the root secret. During a live session the DDK necessarily sits in RAM so the
+engine can encode, decode and index. That is inherent to any queryable encrypted store, not
+specific to this design — a memory dump of a live process is a different threat from disk
+theft, and this system does not claim to defend against the former.
 
-## 2. Storage format
+---
 
-Every record is TLV-encoded (`binary-codec.js`, protobuf-style: field-number tags, varints,
-no field names on the wire) before encryption -- roughly 2.5x smaller than the equivalent
-JSON in the included benchmark, and unknown field numbers are skipped rather than erroring,
-so schemas can gain fields later without invalidating already-written records.
+## 8. Storage format
 
-On-disk frame (append-only per collection, `seg-NNNNNN.log`):
+Records are TLV-encoded (`binary-codec.js`, protobuf-style field-number tags and varints) before
+encryption — roughly 2.5x smaller than the equivalent JSON, and unknown field numbers are
+skipped rather than erroring, so schemas can gain fields without invalidating stored records.
 
 ```
 [op:1][flags:1][id:8 BE][version:4 BE][payloadLen:4 BE][payload = iv(12)+tag(16)+ciphertext]
 ```
 
-`payload` is AES-256-GCM over the (optionally zlib-deflated) encoded record, with
-`AAD = id ++ op ++ flags ++ version`. Binding `version` into the AAD is what makes a
-monotonic per-id counter tamper-evident: a storage node cannot serve an older, perfectly
-authentic frame for the same id without a client tracking version watermarks
-(`version-watermark.js`) being able to detect the regression. See "Threat model" below --
-this closes the rollback/replay gap that a bare AEAD scheme leaves open.
+`payload` is AES-256-GCM over the (optionally deflated) record with `AAD = id ‖ op ‖ flags ‖
+version`. Binding `version` into the AAD is what makes the monotonic per-id counter
+tamper-evident: a storage node cannot serve an older but perfectly authentic frame without a
+client tracking watermarks (`version-watermark.js`) detecting the regression. AEAD proves a
+record is genuine, not that it is the latest.
 
-Recovery on open: a binary `index.snapshot` (primary index only: id -> segment/offset/
-length/version/flags/deleted) means a clean-close-then-reopen doesn't replay any data at
-all; an unclean shutdown replays only the tail past the snapshot's last recorded position,
-not the whole collection. Secondary/blind indexes are rebuilt at open time by seeking
-directly to each live record's known offset (via the now-fast primary index) and decrypting
-just that record -- O(live records), not O(bytes on disk).
+Recovery: a binary `index.snapshot` means a clean reopen replays nothing; an unclean shutdown
+replays only the tail past the snapshot. Compaction copies live frames byte-for-byte — no
+decrypt/re-encrypt, since the AAD binds nothing that relocation changes.
 
-Compaction copies live *frames* byte-for-byte into a fresh segment (no decrypt/re-encrypt
-needed, since AAD only binds id/op/flags/version, all unchanged by relocation) and deletes
-the old segment files.
+---
 
-## 3. Capability tokens (the "database server as its own edge" path)
+## 9. Indexes, and what each one leaks
 
-```
-client --edge-mediated--> edge/gateway --RBAC-checked--> database
-client --direct (capability token)------------------------> database
-```
+| Kind | Query | What the server learns |
+|---|---|---|
+| `index: true` | equality, enumerable | the plaintext value |
+| `blindIndex: true` | equality with an **already-known** value | which records share a value |
+| `rangeBucket: { width }` | range | which bucket (e.g. which day), not the value or cross-bucket order |
+| `diskBacked: true` + `index` | ordered range scan | the real order of every indexed value |
 
-`DatabaseManager.openDatabase()` (called by whoever holds edge-level RBAC authority) warms
-a database's DDK into memory. From then on, `IssueCapability`-style calls (see
-`examples/grpc-integration-sketch.js`) mint a **kid+HMAC, scoped, short-lived, single-use**
-token (`capability-token.js`) that a client can present directly to `direct-server.js`'s
-TCP/TLS listener, with no further round trip through the gateway for that operation:
+A blind index answers exactly one question: "does a record with this exact value exist". It
+**cannot** enumerate — doing so would mean testing every possible value, which is precisely the
+plaintext-searchable structure blind indexing exists to avoid. Anything meant to be *browsable*
+belongs on a plain index or a scan. Both `object-store.js` and `secret-store.js` are shaped
+around this: `ownerId`/`kind` are plain, `originalFileName`/`name` are blind.
 
-- `kid` lets signing keys rotate without invalidating every outstanding token.
-- `scope` is a `DB_PERMISSIONS` bitmask, and must be a subset of the issuer's own ACL mask
-  for that database -- a capability can only narrow authority, never grant more of it.
-- `jti` (Snowflake) + `singleUse` enforce replay rejection via a small pruned-by-expiry set.
-- TTLs are meant to be short (seconds), unlike the ~1h main session token.
+Range queries are bucketed blind indexing, explicitly **not** order-preserving encryption. OPE
+is a research-grade primitive that is easy to implement in a way that looks fine and leaks far
+more than intended; bucketing's leakage is explicit and tunable by width.
 
-This directly matches the "geçici hmac + kid... küçük yetkiler içerir" design from the
-original brief.
+`diskBacked: true` moves an index into an SSTable-style segment with a bounded memtable —
+measured at ~200 resident entries and ~38 sparse-index blocks for a 5000-record field, versus
+5000 for a plain Map. Deliberately one on-disk segment, fully rewritten per flush: a much
+smaller correctness surface than leveled compaction, at the cost of O(total) flush I/O.
 
-## 4. On the pasted MLS/gRPC design documents
+---
 
-Those documents were engaged with as a design proposal to critique and build from, per the
-explicit request at the end of the first one -- not as an unconditional spec, regardless of
-how directively later drafts of it were phrased. Where this project agrees, disagrees, or
-answers an open question differently, briefly:
+## 10. Known limitations
 
-- **MLS-as-KEK-source, not as a record cipher**: agreed, and it's exactly what
-  `MlsExportSecretKeyProvider` implements. `rewrapDatabaseKey()` gives the O(1) rotation
-  the docs describe -- re-wrap the *same* DDK under a new KEK, zero record/segment I/O,
-  verified end to end in `examples/mls-key-provider-demo.js`.
-- **Is full MLS warranted here?** For a genuinely single-operator database (one person,
-  own devices/sessions, nobody else ever joins), probably not -- epoch ratcheting exists to
-  make *group* rekeying on join/leave cheap, which has no payoff at group size 1.
-  `ClientSecretKeyProvider` covers that case with a single static secret. MLS earns its
-  keep specifically once real multi-party sharing exists (RFC 0002's User A <-> User B
-  scenario) -- the pluggable interface means that switch costs nothing in the storage layer
-  whenever it becomes real, rather than needing it to be true on day one.
-- **AES Key Wrap (RFC 3394) vs AES-256-GCM for wrapping the DDK**: kept AES-256-GCM (what's
-  already implemented for records). AES-KW's main advantage is legacy interop (PKCS#11,
-  JOSE `A256KW`); it doesn't buy anything here that reusing one well-analyzed,
-  hardware-accelerated AEAD for both records and key-wrapping doesn't already provide, and
-  it avoids maintaining two different constructions.
-- **Per-collection DDK**: implemented as `HKDF(DDK, 'collection:'+name)` rather than an
-  independent random key per collection -- same compromise-isolation property, zero extra
-  wrapped-key bookkeeping in the manifest. A fully independent key only pays for itself if a
-  single collection needs to be shared/rotated without touching the rest of the database, at
-  which point it likely deserves to be its own database rather than a collection of a shared
-  one.
-- **Per-document keys** (`HKDF(DDK, docId)`): not implemented, deliberately. AES-GCM with a
-  random 96-bit nonce per record (already the design) gives strong CPA resistance on its
-  own; per-document key derivation would only start to matter somewhere past ~2^32 records
-  under one key, far beyond this system's scale.
-- **Blind-index frequency analysis**: real, and not solved here beyond noting the mitigation
-  space -- bucket/coarsen low-cardinality or highly sensitive fields rather than indexing
-  exact values, and treat true frequency-hiding SSE as a research-grade separate project, not
-  something to bolt on ad hoc.
-- **"Cryptographically blind" needs a precise boundary.** A server holding a blind-indexing
-  key (BIK) -- RFC 0002's "constrained client" -- is blind to *payload plaintext* but not
-  blind to *which records share an equal value* for any blind-indexed field. That's the same
-  property this project's own `blindIndex` fields already have. Worth stating precisely
-  rather than accepting an unqualified "the server cannot inspect the data" for a design that
-  hands the server a working equality trapdoor for some fields.
-- **Rollback/snapshot replay by the storage node**: this was a real gap in the first version
-  of this engine (AAD bound id+op+flags but no freshness signal across writes). Fixed by
-  folding a monotonic per-id `version` into the AEAD AAD and giving clients
-  `version-watermark.js` to detect a storage node serving a stale-but-authentic frame -- see
-  `getWithVersion()` / the rollback check in `direct-access-demo.js`.
-- **EMFILE at scale**: the first version of `storage-engine.js` opened one read file handle
-  per segment and never closed any of them. `_getReadFd()` is now a small LRU-bounded pool
-  (`maxOpenReadFds`, default 64) -- verified with a synthetic 150-segment stress test that
-  never exceeds the configured cap regardless of access pattern.
-- **Worker-thread offloading for crypto/zlib**: not applied. Node's AES-GCM and zlib calls
-  are native (OpenSSL/zlib under the hood) and fast on the record sizes this engine targets;
-  the "MUST offload to Worker Threads" directive reads like it's aimed at a much
-  higher-throughput multi-tenant deployment than what's being built for right now. Worth
-  revisiting if record sizes or write rates grow by orders of magnitude, not before.
-- **Multi-tenancy, backups, recovery, cluster sync** (open questions #6-#9): mostly already
-  free or straightforward given the existing partitioning --  every `(ownerId, dbId)` is
-  already fully isolated with its own derived key; a raw copy of a database's directory
-  *is* an encrypted backup; cluster sync of a ~60-byte wrapped key is not a hard consensus
-  problem. Lost-credential recovery (an escrow/recovery-code wrapped-DDK entry) is not
-  implemented and is a reasonable, small future addition, not a redesign.
-
-## 5. Responses to the RFC 0003 scaling directive
-
-RFC 0003 asked for disk-backed indexes, connection multiplexing, row-level ACL, range
-queries, and worker-thread offloading. Same posture as with the earlier documents: engaged
-with as a scaling proposal to weigh against the current single-operator deployment context,
-not executed as an unconditional checklist. What actually shipped, and why, per item:
-
-### 5.1. Disk-backed secondary/blind indexes -> persisted index snapshots (not a B-tree)
-The directive's real underlying complaint was boot time (`O(live records)` decrypt cost on
-every open), which does not actually require a persistent B-tree/LSM to fix. Implemented
-instead: the binary `index.snapshot` now also persists the secondary and blind index tables
-(not just the primary id->location index), with the same snapshot+tail-replay recovery
-discipline already used for the primary index. Measured on 3000-4000 records with 2 indexed
-fields: **4-11x faster reopen** than the full decrypt-based rebuild (varies by run; see
-`examples/index-snapshot-demo.js`, which asserts the snapshot path beats the full-rebuild
-path rather than just asserting a hardcoded number). A hand-rolled on-disk B-tree was
-deliberately NOT built in this pass: correctness bugs in page-splitting/WAL-interaction are
-exactly the subtle, hard-to-catch-by-casual-testing kind of bug (this session already found
-and fixed two real ones -- the FD leak and the rollback gap -- through careful review, which
-is evidence rushing a much harder data structure is risky, not a reason to avoid the review).
-A real disk-backed structure was still built, just one iteration later -- see §6.
-
-### 5.2. Connection multiplexing + SCAN/cursor
-Implemented for real: `direct-protocol.js` v2 adds a `requestId` to both frames (a breaking,
-clean replacement of v1 -- nothing had shipped against v1 yet), `direct-server.js` keeps a
-connection open across many requests (idle-timeout bounded) instead of one-shot-per-socket,
-and a `SCAN` opcode paginates a collection via an id-based cursor (Snowflake ids are roughly
-time-ordered, so "id > cursor" gives stable pagination without a separate sorted structure).
-`examples/direct-access-demo.js` fires 30 concurrent requests over one connection and
-verifies every response is matched back to its request by `requestId` regardless of
-completion order, plus a full multi-page SCAN.
-
-### 5.3. Row-level access control -> row-*filtered capability tokens (not general ACL)
-Implemented the narrow, precise version: `CapabilityTokenService.issue()` accepts an
-optional `rowFilter: {field, value}`; `direct-server.js` enforces it against the decrypted
-record for GET/FIND_ONE/SCAN (hides non-matching records as if they didn't exist) and PUT
-(refuses to write a record that doesn't satisfy the filter). This is an authorization check
-on already-decrypted plaintext -- the same trust tier as the rest of the direct-access path,
-**not** a blind/searchable-encryption-level guarantee that the enforcing party never sees
-what it's filtering on. True row-level ACL enforced *without* the enforcer seeing plaintext
-is an attribute-based-encryption-class problem; general `allowedMembers` arrays and
-multi-member predicates were not built since no concrete need for them exists yet in a
-single-operator deployment -- `rowFilter.value` naturally generalizes to
-`allowedMembers.includes(...)` if/when it does.
-
-### 5.4. Worker-thread CPU offloading -> measured, then scoped narrowly (not general)
-Benchmarked before writing any integration code (see the numbers in `crypto-worker-pool.js`
-and this session's history): for fitdb's realistic record sizes, dispatching AES-256-GCM to
-`node:worker_threads` is **slower**, not faster -- 1KB payloads: ~7x slower; 20000x200B
-records batched up to 1000-per-message: still ~3.4-3.7x slower. Message-passing/structured-
-clone overhead dominates at these sizes regardless of batching strategy. The crossover to a
-real win only appears around **~100-128KB single payloads under real concurrent load**
-(a pool of workers each handling a different large payload, not one worker processing many
-small ones sequentially). fitdb records are small structured rows; large blobs already have
-a dedicated path in the existing S3-like ObjectStoreService, not this engine. Built
-accordingly: `CryptoWorkerPool` is opt-in and size-gated (default 128KB threshold) via
-`CollectionStorage`'s `cryptoOffload` option; below the threshold, behavior is byte-for-byte
-identical to no pool at all (verified in `examples/crypto-offload-demo.js`, which confirms
-zero pool invocations for small records and correct round-tripping for a 200KB one). No
-general-purpose worker pool was wired into the default put/get path, because the measurements
-say that would be a regression for the common case, not an optimization.
-
-### 5.5. Range queries -> bucketized/coarsened blind indexing (explicitly not OPE)
-A schema field can set `rangeBucket: { width }`; the stored index entry is a blind-indexed
-*bucket* (`floor(value/width)`), not the value itself. `Collection.findRange(field, min,
-max)` enumerates the buckets overlapping `[min,max]`, gathers candidates, decrypts, and
-applies an exact filter. This is deliberately **not** Order-Preserving Encryption: a real OPE
-scheme is a research-grade primitive (subtle security properties, easy to implement
-incorrectly in a way that looks fine but leaks far more than intended), and hand-rolling one
-here would be worse than being upfront about not attempting it. Bucketing's leakage is
-explicit and tunable: the server learns which bucket a record falls into (e.g. "which day"
-for a day-width bucket), not its exact value or its relative order versus other records
-outside shared buckets -- narrower leakage than OPE by construction, at the cost of
-imprecise buckets needing a post-decrypt filter. Verified in `examples/range-query-demo.js`
-for boundary correctness (single-bucket-width windows, multi-bucket windows, empty ranges)
-and persistence across a reopen.
-
-## 6. Real disk-backed indexes (bounded memory, not just persisted)
-
-§5.1 shipped persisted-but-fully-RAM-resident secondary/blind/range indexes. This section is
-the actual disk-backed structure: mark a field `diskBacked: true` (alongside `index`,
-`blindIndex`, or `rangeBucket`) and its index moves to `SecondaryIndexStore`
-(`secondary-index-store.js`), backed by `SortedIndexSegment` (`sorted-index-segment.js`) --
-an SSTable-style file (sorted data blocks + a sparse in-memory index, one entry per ~128
-keys, in the spirit of LevelDB/RocksDB). Writes land in a small bounded memtable; once it
-exceeds `flushThreshold` (default 2000) it is merge-sorted against the existing on-disk
-segment and rewritten as a fresh immutable file (old one discarded) -- the same
-never-mutate-in-place, always-write-new-and-swap discipline used everywhere else in fitdb.
-
-Measured on 5000 records with a 300-entry flush threshold: **only ~200 entries ever sit in
-the memtable and only ~38 sparse-index blocks are RAM-resident** for the whole field, versus
-5000 if it were a plain Map (`examples/disk-backed-index-demo.js` asserts this directly, not
-just prints it). Also new: `findRangePlain(field, min, max)` for a plain (non-blind, non-
-bucketed) `diskBacked` numeric field, doing a genuine ordered range scan on disk via the
-segment's sorted blocks -- the confidentiality trade-off is explicit: unlike `rangeBucket`,
-this field's real value order is visible to the server, so only use it where that's fine.
-
-Deliberately simplified relative to a full multi-level LSM: exactly one on-disk segment at a
-time, fully rewritten on every flush (O(total entries) I/O per flush, not O(memtable size)).
-That trades some flush-time I/O for a much smaller, more auditable correctness surface --
-worth it at this project's scale; revisit with leveled compaction only if flush cost is ever
-actually measured to matter.
-
-## 7. Object store: S3-bucket logic integrated with fitdb (`object-store.js`)
-
-`FitObjectStore` wraps a fitdb `Database`: object *metadata* (owner, visibility, filename,
-size, content-type, timestamps) is a normal fitdb collection (reusing RBAC, Snowflake ids,
-and the indexes from §7 directly); object *bytes* live on disk, split by visibility exactly
-as requested:
-
-- **Public** (`putPublicObject`): bytes stored **plaintext**, served by a real, tested HTTP
-  server (`object-http-server.js`) at `GET /objects/public/<slug>` -- genuine S3-style
-  unauthenticated URL access. Encrypting public bytes would only relocate the exposure point
-  to wherever the key gets handed out (which would have to be "anyone", since that's what
-  public means), for zero actual gain.
-- **Private** (`putPrivateObject`): bytes are **chunked-AEAD-encrypted** (`encrypted-blob.js`)
-  -- each fixed-size chunk is its own independent AES-256-GCM frame (AAD-bound to
-  objectId+chunkIndex), the same reasoning already applied to every database record: a
-  single whole-file AEAD tag would force buffering the entire file to encrypt or verify,
-  which doesn't scale. This lets both writing and reading stream at O(chunkSize) memory
-  regardless of object size (verified with a multi-chunk, non-block-aligned object; tamper
-  and truncation are both independently caught, per `examples/object-store-demo.js`).
-  Private bytes are reachable **only** through `direct-server.js`'s new `OBJECT_DOWNLOAD`
-  opcode, capability-token-gated exactly like every other direct-access operation (owner-only
-  by default via the token's `sub`, or cross-owner with an `ADMIN`-scoped token) -- this is
-  the "already gRPC-based, security completed" private path from the request: no alternate
-  route to private bytes exists anywhere in this module.
-
-### 8.1. Collection titles
-`defineCollection(name, { title, description, fields })` persists a human-readable
-title/description in the manifest (`Database.listCollectionInfo()` reads them back) -- e.g.
-`FitObjectStore.defineObjectsCollection` sets title `"Objects"`. Purely a display/UI
-convenience; has no effect on storage or indexing.
-
-### 8.2. Blind search cannot enumerate -- and this store never tries to make it
-A blind index answers exactly one question: "does a record with this *exact, already-known*
-value exist" -- structurally, not as an implementation gap, it cannot answer "list
-everything", because doing so would mean testing every possible value against the index,
-which is precisely the plaintext-searchable structure blind indexing exists to avoid handing
-the server. `object-store.js`'s schema reflects this on purpose: `ownerId` is a **plain**
-index (the server already has to know ownership to do RBAC at all, so this isn't a new
-disclosure) and is what `listOwned(ownerId)` is built on; `originalFileName`/`publicSlug`
-stay blind-indexed and are used **only** for exact-match lookups (`findByExactName`,
-`findPublicBySlug`), never for browsing. `examples/object-store-demo.js` exercises both
-paths side by side so the distinction is concrete, not just asserted in a comment.
-
-## 8. A recurring gotcha worth flagging explicitly: `_id` is BigInt, most other "id" values are strings
-A decoded record's `_id` (and any `int64`/`uint64` field) is a **BigInt** -- necessary since
-JS `Number` silently loses precision above 2^53 and Snowflake ids exceed that. But
-`Collection.insert()` returns a **string**, as do `dbId`, capability-token `sub`, and most
-function parameters named `id`. `bigintValue === stringValue` is always `false` in JS (no
-implicit coercion under `===`), so comparing an id fresh out of a decoded record against one
-of those string-typed values needs an explicit `String(...)` (or `BigInt(...)`) on one side.
-This bit the test suite itself three separate times while building this project -- worth
-naming plainly here rather than leaving it as a silent trap, since a real caller is exactly
-as likely to hit it.
-
-## 9. Known limitations / good next steps
-- `SecondaryIndexStore` keeps exactly one on-disk segment (§7); a flush costs O(total field
-  entries), not O(memtable size) -- fine unless a field's total entry count gets very large
-  *and* writes are frequent enough for flush cost to show up, at which point leveled
-  compaction (multiple segments, lazily merged) is the natural next step.
-- `direct-server.js`'s SCAN still sorts the full remaining candidate set per page call
-  (O(n log n)); a collection that outgrows this should move its ordering field to a
-  `diskBacked` plain index and paginate via `findRangePlain`-style disk-backed ordering
-  instead of the generic id-cursor SCAN.
-- No hardware-enclave-backed key caching; would require native bindings (SGX/TPM), out of
-  scope for a pure Node-built-ins implementation.
-- The direct-access object-download protocol is JSON+base64 framed (~33% overhead on wire),
-  consistent with this channel's existing "control-plane simplicity over wire efficiency"
-  tradeoff (see direct-protocol.js) -- real binary framing is a contained follow-up if object
-  transfer volume ever makes that overhead matter.
+- `SecondaryIndexStore` keeps one on-disk segment; a flush costs O(total field entries).
+  Leveled compaction is the natural next step if that ever measures.
+- `SCAN` sorts the full remaining candidate set per page; a collection that outgrows this
+  should move its ordering field to a `diskBacked` plain index.
+- No CRL or OCSP client. Revocation at this layer is the principal allow-list.
+- The direct-access object protocol is JSON+base64 framed (~33% overhead), consistent with that
+  channel's control-plane-simplicity tradeoff.
+- No hardware-enclave key custody; that needs native bindings, out of scope for a pure Node
+  implementation.
+- `_id` is a **BigInt** in a decoded record, while `insert()` returns a **string**, as do
+  `dbId` and capability-token `sub`. `bigintValue === stringValue` is always false in JS —
+  compare with an explicit `String(...)` on one side. This bit the test suite three times
+  while the engine was being built.
