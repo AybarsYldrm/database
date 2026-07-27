@@ -4,6 +4,7 @@ const path = require('node:path');
 const { CollectionStorage } = require('./storage-engine');
 const { hkdf } = require('./crypto-core');
 const { ChangeHub, CHANGE_OPS } = require('./change-stream');
+const { planMigration, describeBlockers, SchemaMigrationError } = require('./schema-migration');
 
 const STORAGE_OP_PUT = 1; // mirrors OP_PUT/OP_DELETE in storage-engine.js
 
@@ -27,11 +28,21 @@ function deriveCollectionKey(ddk, collectionName) {
   return hkdf(ddk, Buffer.alloc(0), Buffer.from(`fitdb-collection-v1:${collectionName}`), 32);
 }
 
-function normalizeSchema(fields) {
+function normalizeSchema(fields, { reserved = [] } = {}) {
   const NUMERIC_TYPES = new Set(['int32', 'int64', 'uint32', 'uint64', 'float', 'double']);
+  const reservedSet = new Set(reserved);
   for (const f of fields) {
     if (f.no === RESERVED_FIELD_NO || f.name === RESERVED_FIELD_NAME) {
       throw new Error(`fitdb: field number ${RESERVED_FIELD_NO} and name '_id' are reserved for the auto-managed primary key`);
+    }
+    // A number retired by an earlier migration must never come back under a new meaning:
+    // records written while it was live still carry bytes under that tag, and they would be
+    // read as the new field. Same discipline as protobuf's `reserved`.
+    if (reservedSet.has(f.no)) {
+      throw new Error(
+        `fitdb: field number ${f.no} is reserved on this collection (it was used by a field that has since been removed) `
+        + `and cannot be reused for '${f.name}'`,
+      );
     }
     if (!ALLOWED_TYPES.has(f.type)) throw new Error(`fitdb: unsupported field type '${f.type}' on '${f.name}'`);
     if ((f.index || f.blindIndex) && f.type === 'bytes') {
@@ -183,7 +194,11 @@ class Database {
       const storage = new CollectionStorage({
         dir: path.join(this.dir, 'collections', name),
         ddk: deriveCollectionKey(this.ddk, name),
-        schema: normalizeSchema(def.fields),
+        // Passing `reserved` here is an integrity check rather than a normal path: a manifest
+        // whose field list uses a retired number would be one written by something that
+        // bypassed the migration rules, and catching it at open beats decoding old records
+        // under a new field's type.
+        schema: normalizeSchema(def.fields, { reserved: def.reserved || [] }),
         segmentMaxBytes: def.options?.segmentMaxBytes,
         compress: def.options?.compress,
         onChange: this._changeSink(name),
@@ -199,8 +214,36 @@ class Database {
     return [...this.collections.values()].map((c) => ({ name: c.name, title: c.title, description: c.description }));
   }
 
-  defineCollection(name, { fields, title = null, description = null, segmentMaxBytes = 16 * 1024 * 1024, compress = false } = {}) {
-    if (this.collections.has(name)) return this.collections.get(name);
+  /**
+   * Defines a collection, or evolves the one that already exists.
+   *
+   * Calling this again with an extra field used to return the existing collection untouched,
+   * which meant the new field had no tag in the encoder and every value written to it was
+   * silently discarded -- no error, no warning, just missing data. Redefining is now a
+   * migration: additive changes are applied, index changes trigger a rebuild from the stored
+   * records, and anything that would misread data already on disk is refused with an
+   * explanation of what to do instead.
+   *
+   * @param {object}   [opts.dropFields]  field names the caller accepts losing; their numbers
+   *   are then reserved forever, because records written while they were live still carry
+   *   bytes under those tags.
+   * @param {boolean}  [opts.migrate=true] false restores the old return-as-is behaviour.
+   */
+  defineCollection(name, { fields, title = null, description = null, segmentMaxBytes = 16 * 1024 * 1024, compress = false, dropFields = [], allowRetype = false, migrate = true } = {}) {
+    const existingDefinition = this.manifest.collections?.[name];
+
+    if (this.collections.has(name) || existingDefinition) {
+      if (!migrate) {
+        const existing = this.collections.get(name);
+        if (existing) return existing;
+      } else {
+        const collection = this._migrateCollection(name, {
+          fields, title, description, dropFields, allowRetype,
+        });
+        if (collection) return collection;
+      }
+    }
+
     const schema = normalizeSchema(fields);
     const storage = new CollectionStorage({
       dir: path.join(this.dir, 'collections', name),
@@ -213,11 +256,64 @@ class Database {
     // open() is async but collection creation is synchronous in the public API for
     // ergonomics; callers that need the open (AND the manifest update below) to have fully
     // landed before their first op should await defineCollectionAsync instead.
-    this.manifest.collections[name] = { fields, title, description, options: { segmentMaxBytes, compress } };
+    this.manifest.collections[name] = {
+      fields, title, description, reserved: [], schemaVersion: 1,
+      options: { segmentMaxBytes, compress },
+    };
     const ready = storage.open().then(() => this._persistManifest(this.manifest));
     const collection = new Collection(name, schema, storage, { idGenerator: this._idGenerator, title, description });
     collection._readyPromise = ready;
+    collection.migration = { changed: false, changes: [], rebuilt: false };
     this.collections.set(name, collection);
+    return collection;
+  }
+
+  /**
+   * Applies a schema change to an already-defined collection. Returns null if the collection
+   * is not open yet (the caller then falls through to a normal open), otherwise the collection
+   * with `migration` describing what happened.
+   */
+  _migrateCollection(name, { fields, title, description, dropFields, allowRetype }) {
+    const definition = this.manifest.collections[name];
+    const collection = this.collections.get(name);
+    if (!definition || !collection) return null;
+
+    const reserved = definition.reserved || [];
+    const plan = planMigration(definition.fields || [], fields, { reserved, dropFields, allowRetype });
+
+    if (!plan.applicable) throw new SchemaMigrationError(describeBlockers(name, plan), plan.blocked);
+
+    if (!plan.changed) {
+      collection.migration = { changed: false, changes: [], rebuilt: false };
+      return collection;
+    }
+
+    const schema = normalizeSchema(fields, { reserved: plan.newReserved });
+
+    definition.fields = fields;
+    definition.reserved = plan.newReserved;
+    definition.schemaVersion = (definition.schemaVersion || 1) + 1;
+    if (title !== null) definition.title = title;
+    if (description !== null) definition.description = description;
+
+    collection.schema = schema;
+    if (title !== null) collection.title = title;
+    if (description !== null) collection.description = description;
+
+    // The manifest is persisted only after the storage layer has accepted the new schema and
+    // rebuilt its indexes, so a crash mid-migration leaves the old, consistent definition on
+    // disk rather than a manifest that promises a schema the indexes do not reflect.
+    collection._readyPromise = collection.storage
+      .applySchema(schema, { rebuildIndexes: plan.needsRebuild })
+      .then(() => this._persistManifest(this.manifest));
+
+    collection.migration = {
+      changed: true,
+      changes: plan.changes,
+      rebuilt: plan.needsRebuild,
+      schemaVersion: definition.schemaVersion,
+      reserved: plan.newReserved,
+    };
     return collection;
   }
 
@@ -225,6 +321,56 @@ class Database {
     const collection = this.defineCollection(name, opts);
     await collection._readyPromise;
     return collection;
+  }
+
+  /**
+   * Reports what redefining a collection with `fields` would do, without doing it. Intended
+   * for a deploy-time check: a migration that turns out to be refused is much better
+   * discovered by a pipeline than by the first write after a rollout.
+   */
+  inspectMigration(name, fields, { dropFields = [], allowRetype = false } = {}) {
+    const definition = this.manifest.collections?.[name];
+    if (!definition) return { exists: false, changed: true, applicable: true, changes: [], blocked: [] };
+    const plan = planMigration(definition.fields || [], fields, {
+      reserved: definition.reserved || [], dropFields, allowRetype,
+    });
+    return { exists: true, ...plan };
+  }
+
+  /**
+   * Defines or evolves every collection in a registry object -- the shape a project's
+   * `schemas.js` already has:
+   *
+   *   { users: { fields: [...] }, sessions: { fields: [...] } }
+   *
+   * Runs the whole set through inspectMigration first and refuses before touching anything if
+   * any collection is blocked. A partial migration across a related set of collections is much
+   * worse than none: the application comes up against a schema that is half old and half new.
+   */
+  async applySchemaRegistry(registry, { dropFields = {}, allowRetype = false, dryRun = false } = {}) {
+    const blocked = [];
+    for (const [name, definition] of Object.entries(registry)) {
+      const plan = this.inspectMigration(name, definition.fields, {
+        dropFields: dropFields[name] || [], allowRetype,
+      });
+      if (plan.exists && !plan.applicable) blocked.push({ name, plan });
+    }
+    if (blocked.length > 0) {
+      const detail = blocked.map(({ name, plan }) => describeBlockers(name, plan)).join('\n');
+      throw new SchemaMigrationError(`fitdb: schema registry cannot be applied:\n${detail}`, blocked);
+    }
+
+    const applied = {};
+    for (const [name, definition] of Object.entries(registry)) {
+      if (dryRun) { applied[name] = this.inspectMigration(name, definition.fields); continue; }
+      const collection = await this.defineCollectionAsync(name, {
+        ...definition,
+        dropFields: dropFields[name] || [],
+        allowRetype,
+      });
+      applied[name] = collection.migration;
+    }
+    return applied;
   }
 
   collection(name) {

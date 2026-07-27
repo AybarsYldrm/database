@@ -52,10 +52,23 @@ const DATABASE_SCHEMAS = {
     { no: 5, name: 'description', type: 'string' },
     { no: 6, name: 'compress', type: 'bool' },
     { no: 7, name: 'segmentMaxBytes', type: 'int64' },
+    // Redefining an existing collection is a migration. Additive changes and index changes
+    // apply automatically; removing a field needs naming it here, because its bytes stay in
+    // every record already written and its number is reserved forever afterwards.
+    { no: 8, name: 'dropFields', type: 'string', repeated: true },
+    // Report what would happen without doing it -- for a deploy-time check, where a refused
+    // migration is far better found by a pipeline than by the first write after a rollout.
+    { no: 9, name: 'dryRun', type: 'bool' },
+    { no: 10, name: 'allowRetype', type: 'bool' },
   ],
   [`${DB}_DefineCollectionRes`]: [
     { no: 1, name: 'message', type: 'string' },
     { no: 2, name: 'created', type: 'bool' },
+    { no: 3, name: 'migrated', type: 'bool' },
+    { no: 4, name: 'changesJson', type: 'string' },
+    { no: 5, name: 'indexesRebuilt', type: 'bool' },
+    { no: 6, name: 'schemaVersion', type: 'int32' },
+    { no: 7, name: 'reserved', type: 'int32', repeated: true },
   ],
 
   [`${DB}_DescribeCollectionReq`]: [

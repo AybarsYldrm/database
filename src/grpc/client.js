@@ -321,13 +321,64 @@ class RemoteDatabase {
     return this._collections.get(name);
   }
 
-  async defineCollection(name, { fields, title = null, description = null, compress = false, segmentMaxBytes = 0 } = {}) {
+  /**
+   * Defines a collection, or migrates the existing one to `fields`.
+   *
+   * Redefining with an extra field is the ordinary way a schema grows, and it applies: the
+   * field starts being encoded, and if it is indexed the index is built from the records
+   * already stored. Removing a field must be named in `dropFields`, because its bytes remain
+   * in every record already written and its number is reserved from then on. Anything that
+   * would misread stored data -- changing a field's type, reusing a retired number -- is
+   * refused with an explanation rather than applied.
+   */
+  async defineCollection(name, { fields, title = null, description = null, compress = false, segmentMaxBytes = 0, dropFields = [], allowRetype = false, dryRun = false } = {}) {
     const res = await this._call('DefineCollection', {
       dbId: this.dbId, collection: name, fieldsJson: JSON.stringify(fields),
       title: title || '', description: description || '', compress,
+      dropFields, allowRetype, dryRun,
       ...(segmentMaxBytes ? { segmentMaxBytes: BigInt(segmentMaxBytes) } : {}),
     });
-    return { ...res, collection: this.collection(name) };
+    const collection = this.collection(name);
+    // Any migration may have changed the field list, so a cached description is stale.
+    collection._schema = null;
+    return {
+      ...res,
+      changes: res.changesJson ? JSON.parse(res.changesJson) : [],
+      collection,
+    };
+  }
+
+  /**
+   * Applies a whole schema registry -- the shape a project's `schemas.js` already has:
+   *
+   *   { users: { fields: [...] }, sessions: { fields: [...] } }
+   *
+   * Every collection is checked with `dryRun` first and nothing is applied if any one of them
+   * would be refused. A partial migration across a related set of collections is worse than
+   * none: the application comes up against a schema that is half old and half new.
+   */
+  async applySchemaRegistry(registry, { dropFields = {}, allowRetype = false, dryRun = false } = {}) {
+    const planned = {};
+    for (const [name, definition] of Object.entries(registry)) {
+      planned[name] = await this.defineCollection(name, {
+        ...definition, dropFields: dropFields[name] || [], allowRetype, dryRun: true,
+      });
+    }
+
+    const refused = Object.entries(planned).filter(([, plan]) => /refused/.test(plan.message));
+    if (refused.length > 0) {
+      const detail = refused.map(([name, plan]) => `${name}: ${plan.changes.filter((c) => c.safety === 'breaking').map((c) => c.reason).join('; ')}`).join('\n');
+      throw new DatabaseClientError(`fitdb: schema registry cannot be applied:\n${detail}`, GRPC_STATUS.FAILED_PRECONDITION);
+    }
+    if (dryRun) return planned;
+
+    const applied = {};
+    for (const [name, definition] of Object.entries(registry)) {
+      applied[name] = await this.defineCollection(name, {
+        ...definition, dropFields: dropFields[name] || [], allowRetype,
+      });
+    }
+    return applied;
   }
 
   async listCollections() {

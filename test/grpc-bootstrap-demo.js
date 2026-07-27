@@ -5,7 +5,8 @@ const path = require('node:path');
 const fsp = require('node:fs/promises');
 const crypto = require('node:crypto');
 
-const { GrpcClient, GRPC_STATUS } = require('@fitfak/grpc');
+const { requireGrpc } = require('./helpers/require-grpc');
+const { GrpcClient, GRPC_STATUS } = requireGrpc();
 const { createDatabaseServer } = require('../src/grpc/server');
 const { connectDatabase } = require('../src/grpc/client');
 const { enroll, TrustError } = require('../src/provisioning/enrollment-client');
@@ -385,7 +386,37 @@ async function main() {
     resolverHandle.close();
   }
 
-  console.log('\n[11] Capability tokens may only narrow authority');
+  console.log('\n[11] Schema evolution over the wire');
+  {
+    const collection = db.collection('kullanicilar');
+    const current = (await collection.describe({ refresh: true })).fields.filter((f) => f.no !== 1);
+
+    const plan = await db.defineCollection('kullanicilar', {
+      fields: [...current, { no: 7, name: 'lastSeenAt', type: 'int64', index: true }],
+      dryRun: true,
+    });
+    check('a dry run reports the change without applying it', plan.migrated && plan.changes[0].kind === 'add-field');
+    check('and nothing changed', (await collection.describe({ refresh: true })).fields.every((f) => f.name !== 'lastSeenAt'));
+
+    const applied = await db.defineCollection('kullanicilar', {
+      fields: [...current, { no: 7, name: 'lastSeenAt', type: 'int64', index: true }],
+    });
+    check('applying it reports the migration', applied.migrated === true && applied.indexesRebuilt === true);
+    check('and bumps the schema version', applied.schemaVersion === 2);
+
+    const id = await collection.insert({ email: 'sema@fitfak.net', tenant: 'core', lastSeenAt: 1700000000000 });
+    check('the new field round trips', String((await collection.get(id)).lastSeenAt) === '1700000000000');
+    check('and is queryable', (await collection.find('lastSeenAt', '1700000000000')).length === 1);
+
+    await assert.rejects(
+      () => db.defineCollection('kullanicilar', { fields: current.map((f) => (f.no === 3 ? { ...f, type: 'int64' } : f)) }),
+      // A refused migration is the caller's schema being wrong, not a server fault.
+      (err) => err.code === GRPC_STATUS.INVALID_ARGUMENT,
+    );
+    check('a breaking change is refused over the wire too', true);
+  }
+
+  console.log('\n[12] Capability tokens may only narrow authority');
   {
     const capability = await db.issueCapability({
       collection: 'kullanicilar',

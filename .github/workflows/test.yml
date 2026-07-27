@@ -1,0 +1,76 @@
+name: test
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+jobs:
+  engine:
+    # The storage engine has no dependencies at all, so this job needs no install step and
+    # nothing to resolve. It is the part that must never be blocked by packaging.
+    name: engine (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['18', '20', '22']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm run test:engine
+
+  transport:
+    # The gRPC layer depends on @fitfak/grpc. Until that is published, CI checks out the
+    # sibling repository and links it, which also means this job fails loudly if the two
+    # drift apart -- exactly the breakage a published-package-only setup would hide until
+    # release day.
+    name: transport
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: database
+
+      - uses: actions/checkout@v4
+        id: grpc
+        continue-on-error: true
+        with:
+          repository: AybarsYldrm/grpc
+          ref: ${{ github.head_ref || github.ref_name }}
+          path: grpc
+
+      - name: Fall back to the default branch of @fitfak/grpc
+        if: steps.grpc.outcome == 'failure'
+        id: grpc-default
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          repository: AybarsYldrm/grpc
+          path: grpc
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Link @fitfak/grpc
+        id: link
+        continue-on-error: true
+        working-directory: database
+        run: node scripts/link-grpc.js ../grpc
+
+      - name: Transport, provisioning and adapter compatibility
+        if: steps.link.outcome == 'success'
+        working-directory: database
+        run: |
+          npm run test:secrets-dns
+          npm run test:grpc
+          npm run test:adapter-compat
+
+      - name: Report a missing transport dependency
+        if: steps.link.outcome != 'success'
+        run: |
+          echo "::warning::@fitfak/grpc could not be checked out or linked; transport tests were skipped."
+          echo "Publish @fitfak/grpc, or make AybarsYldrm/grpc reachable from this workflow."

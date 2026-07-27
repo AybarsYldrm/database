@@ -285,9 +285,6 @@ class DatabaseServer extends EventEmitter {
         handler: async (req, call) => {
           const { database, principal } = await self._database(call, req.dbId);
           requirePermission(database, principal, DB_PERMISSIONS.CREATE_COLLECTION, 'define a collection');
-          if (database.collections.has(req.collection)) {
-            return { message: `collection '${req.collection}' already exists`, created: false };
-          }
 
           let fields;
           try { fields = JSON.parse(req.fieldsJson || '[]'); }
@@ -296,20 +293,63 @@ class DatabaseServer extends EventEmitter {
             throw new GrpcError(GRPC_STATUS.INVALID_ARGUMENT, 'fieldsJson must be a non-empty array of field definitions');
           }
 
+          const dropFields = req.dropFields || [];
+          const existed = !!database.manifest.collections?.[req.collection];
+
+          if (req.dryRun) {
+            const plan = database.inspectMigration(req.collection, fields, { dropFields, allowRetype: !!req.allowRetype });
+            return {
+              message: plan.exists
+                ? (plan.applicable ? 'migration would apply' : 'migration would be refused')
+                : 'collection would be created',
+              created: !plan.exists,
+              migrated: !!plan.changed,
+              changesJson: toJson(plan.changes || []),
+              indexesRebuilt: !!plan.needsRebuild,
+              schemaVersion: 0,
+              reserved: plan.newReserved || [],
+            };
+          }
+
+          let collection;
           try {
-            await database.defineCollectionAsync(req.collection, {
+            collection = await database.defineCollectionAsync(req.collection, {
               fields,
               title: req.title || null,
               description: req.description || null,
               compress: !!req.compress,
+              dropFields,
+              allowRetype: !!req.allowRetype,
               ...(req.segmentMaxBytes ? { segmentMaxBytes: Number(req.segmentMaxBytes) } : {}),
             });
           } catch (err) {
-            // normalizeSchema's rejections are all "your schema is wrong", not server faults.
+            // Both a malformed schema and a refused migration are "your schema is wrong",
+            // not a server fault -- and the migration errors carry the remedy in their text.
             throw new GrpcError(GRPC_STATUS.INVALID_ARGUMENT, err.message);
           }
-          self.emit('collectionDefined', { dbId: req.dbId, collection: req.collection, by: principal.id });
-          return { message: `collection '${req.collection}' defined`, created: true };
+
+          const migration = collection.migration || { changed: false, changes: [], rebuilt: false };
+          if (migration.changed) {
+            self.emit('collectionMigrated', {
+              dbId: req.dbId, collection: req.collection, by: principal.id, changes: migration.changes,
+            });
+            self._log?.info?.(`[db] '${principal.id}' migrated ${req.collection}: `
+              + migration.changes.map((c) => `${c.kind}(${c.field})`).join(', '));
+          } else if (!existed) {
+            self.emit('collectionDefined', { dbId: req.dbId, collection: req.collection, by: principal.id });
+          }
+
+          return {
+            message: !existed ? `collection '${req.collection}' defined`
+              : migration.changed ? `collection '${req.collection}' migrated`
+                : `collection '${req.collection}' is already up to date`,
+            created: !existed,
+            migrated: !!migration.changed,
+            changesJson: toJson(migration.changes || []),
+            indexesRebuilt: !!migration.rebuilt,
+            schemaVersion: migration.schemaVersion || database.manifest.collections[req.collection]?.schemaVersion || 1,
+            reserved: migration.reserved || database.manifest.collections[req.collection]?.reserved || [],
+          };
         },
       },
 
