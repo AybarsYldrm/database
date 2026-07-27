@@ -216,6 +216,20 @@ record moved. Without it, two concurrent read-modify-write callers silently lose
 **Binary payloads.** After `describe()`, a client can send `payloadBin` — the collection's own
 TLV encoding — instead of `payloadJson`: same method, roughly 2.5x less on the wire.
 
+### Existing clients
+
+`DatabaseService` is wire-compatible with the hand-written schema map already deployed in the
+IdP's `grpc-db-adapter`: `OpenDatabase`, `InsertRecord`, `UpdateRecord`, `DeleteRecord` and
+`FindRecord` keep their field numbers, and the fields added since (`collections`,
+`sessionExpiresAt`, `payloadBin`, `expectedVersion`) sit at numbers that adapter does not
+declare, so proto3 skips them. `find('_id', id)` and `find('*', '')` are special-cased so the
+adapter's `get()` and `scan()` work unchanged. `test/adapter-compat-demo.js` pins this by
+running that adapter's exact schema map against the server.
+
+The one change an existing adapter does need is transport-level: the data plane is mTLS-only,
+so `{ rejectUnauthorized: false }` with no client certificate is no longer sufficient. Pass
+real credentials, or enrol for them.
+
 ---
 
 ## 3. Not polling
