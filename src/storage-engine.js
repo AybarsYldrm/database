@@ -322,6 +322,68 @@ class CollectionStorage {
     }
   }
 
+  /**
+   * Adopts a new schema for this collection and rebuilds whatever the change invalidated.
+   *
+   * Records on disk are never rewritten: the TLV encoding is tag-based, so a record written
+   * under the old schema still decodes correctly under the new one as long as no field number
+   * changed meaning. That check belongs to schema-migration.js and has already happened by the
+   * time this runs -- this method assumes the change is applicable and only does the work.
+   *
+   * Index state is a different matter. Index tables are keyed by field NAME and their entries
+   * were derived from the old schema's flags, so any change to indexing (a new indexed field,
+   * a rename, a different rangeBucket width, a field gaining or losing diskBacked) leaves
+   * entries that no longer correspond to the schema. Those get discarded and rebuilt from the
+   * live records, which costs one decrypt pass over the collection and is always correct.
+   */
+  async applySchema(newSchema, { rebuildIndexes = true } = {}) {
+    const previousByName = new Map(this.schema.map((f) => [f.name, f]));
+    this.schema = newSchema;
+
+    // Derived keys are cached per field name; a rename or a re-typed index must not keep
+    // using a key derived for the old configuration.
+    this._blindKeys.clear();
+    this._rangeKeys.clear();
+
+    const wanted = new Set(newSchema.filter((f) => f.diskBacked).map((f) => f.name));
+
+    // Fields that stopped being disk-backed (or vanished) leave a segment file behind that no
+    // longer matches any schema field. Closing and deleting it is what keeps a reopen from
+    // loading a stale index for a field that no longer exists.
+    for (const [name, store] of [...this.diskStores]) {
+      if (wanted.has(name)) continue;
+      await store.close().catch(() => {});
+      this.diskStores.delete(name);
+      await fsp.unlink(path.join(this.dir, `secidx-${name}.sidx`)).catch(() => {});
+    }
+
+    for (const name of wanted) {
+      if (this.diskStores.has(name)) continue;
+      const store = new SecondaryIndexStore(path.join(this.dir, `secidx-${name}.sidx`), { flushThreshold: this.diskFlushThreshold });
+      await store.open();
+      this.diskStores.set(name, store);
+    }
+
+    if (!rebuildIndexes) return { rebuilt: false, records: 0 };
+
+    // Every disk-backed store is emptied before the rebuild, not merged into: leaving old
+    // entries in place would keep serving lookups for values that are no longer indexed the
+    // same way, which is the subtlest possible form of a stale index.
+    for (const [name, store] of this.diskStores) {
+      await store.close().catch(() => {});
+      await fsp.unlink(path.join(this.dir, `secidx-${name}.sidx`)).catch(() => {});
+      const fresh = new SecondaryIndexStore(path.join(this.dir, `secidx-${name}.sidx`), { flushThreshold: this.diskFlushThreshold });
+      await fresh.open();
+      this.diskStores.set(name, fresh);
+    }
+
+    await this._rebuildSecondaryIndexes();
+    for (const store of this.diskStores.values()) await store.flush();
+    await this._writeSnapshot();
+
+    return { rebuilt: true, records: this.liveCount(), previousFields: previousByName.size };
+  }
+
   // ---- index snapshot persistence (primary index + secondary/blind index tables) --------
 
   _parseSnapshot(buf) {

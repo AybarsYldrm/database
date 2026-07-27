@@ -27,6 +27,7 @@ const { FitObjectStore, OBJECTS_SCHEMA_FIELDS, deriveObjectBlobKey } = require('
 const { writeEncryptedBlob, readEncryptedBlob, readEncryptedBlobHeader } = require('./encrypted-blob');
 const { createPublicObjectHandler, createPublicObjectServer } = require('./object-http-server');
 const { ChangeHub, ReplicatedView, CHANGE_OPS } = require('./change-stream');
+const { diffSchemas, planMigration, describeBlockers, SchemaMigrationError, SAFETY: MIGRATION_SAFETY } = require('./schema-migration');
 const { SecretStore, SECRETS_SCHEMA_FIELDS, SECRET_KINDS, SECRET_STATES } = require('./secret-store');
 const { DnsStore, ZoneCache, DNS_RECORDS_SCHEMA_FIELDS, DNS_RECORD_TYPES } = require('./dns-store');
 
@@ -51,6 +52,7 @@ module.exports = {
   writeEncryptedBlob, readEncryptedBlob, readEncryptedBlobHeader,
   createPublicObjectHandler, createPublicObjectServer,
   ChangeHub, ReplicatedView, CHANGE_OPS,
+  diffSchemas, planMigration, describeBlockers, SchemaMigrationError, MIGRATION_SAFETY,
   SecretStore, SECRETS_SCHEMA_FIELDS, SECRET_KINDS, SECRET_STATES,
   DnsStore, ZoneCache, DNS_RECORDS_SCHEMA_FIELDS, DNS_RECORD_TYPES,
 };

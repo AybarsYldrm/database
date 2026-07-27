@@ -29,6 +29,7 @@ src/
   secondary-index-store.js Bounded-memory memtable + tombstones over that segment
   storage-engine.js       Encrypted segments, primary/secondary/blind/range indexes, compaction
   change-stream.js        Ordered change events with gap detection — the alternative to polling
+  schema-migration.js     Schema diffing: what may change, what must be rebuilt, what is refused
   version-watermark.js    Client-side rollback/replay detection
   database.js             Collection/Database, per-collection subkeys, watch(), snapshot()
   database-manager.js     create/open/close, manifest, session cache, O(1) key rewrap
@@ -54,7 +55,23 @@ src/
     csr-provider.js       key generation and CSR construction
 ```
 
-`npm test` runs eleven suites. Every file under `test/` is an executable self-check.
+`npm test` runs thirteen suites; every file under `test/` is an executable self-check.
+
+### Installing
+
+The engine has **no dependencies** — `npm run test:engine` (ten suites) runs from a bare
+checkout. The gRPC layer needs `@fitfak/grpc`, which is a sibling package in this stack rather
+than a third-party one; vendoring a second copy of it here would be worse than depending on
+it. Until it is published:
+
+```sh
+npm run link:grpc                     # side-by-side checkout at ../grpc
+node scripts/link-grpc.js /path/to/grpc
+```
+
+`@fitfak/ssl` is an **optional** peer dependency, needed only by the `@fitfak/ssl` CA and CSR
+adapters. A deployment using ACME, or one whose certificates are managed entirely outside this
+process, never loads it.
 
 ---
 
@@ -212,6 +229,51 @@ that has already lost precision is rejected rather than stored corrupted.
 
 **Optimistic concurrency.** `update(id, patch, { expectedVersion })` returns `ABORTED` if the
 record moved. Without it, two concurrent read-modify-write callers silently lose one write.
+
+### Schema evolution
+
+Redefining a collection with an extra field is a **migration**, not a no-op. (It used to be a
+no-op: the new field was absent from the in-memory schema, so the encoder had no tag for it,
+every value written to it was discarded, `get()` never returned it and `find()` threw "no such
+field" — with no error anywhere. Adding a field and redeploying is ordinary, so it has to work
+or fail loudly.)
+
+```js
+await db.defineCollection('certificates', {
+  fields: [...existing, { no: 14, name: 'skidHex', type: 'string', index: true }],
+});
+// → { migrated: true, indexesRebuilt: true, schemaVersion: 2, changes: [{ kind: 'add-field', ... }] }
+```
+
+Field **number** is identity — it is what is written to disk; the name only exists in the
+schema. So the rules follow from the wire format:
+
+| Change | Result |
+|---|---|
+| new field number | applied. Older records simply lack it, as in protobuf |
+| index added/changed/removed | applied, index rebuilt from the stored records |
+| field renamed (same number) | applied — matching is by number, so this is a rename, not a drop plus an add |
+| **type changed** | **refused.** Every stored record carries bytes under that tag and would decode as the new type |
+| **field removed** | **refused** unless named in `dropFields`; its number is then reserved forever |
+| **reserved number reused** | **refused.** Records written while it was live still carry bytes under that tag |
+
+The last one is the trap that arrives months late: a field is dropped, and someone later picks
+a number that looks free. The manifest records `reserved` per collection, so it is caught at
+definition time rather than surfacing as corrupted reads.
+
+Whole registries — the shape a project's `schemas.js` already has — go through in one call,
+and are **all-or-nothing**: every collection is checked first, and one refusal blocks the set.
+A half-applied migration leaves the application facing a schema that is half old and half new.
+
+```js
+await db.applySchemaRegistry(require('./schemas'));                 // embedded
+await remoteDb.applySchemaRegistry(require('./schemas'));           // over gRPC
+db.inspectMigration('certificates', fields);                        // dry run, no writes
+await remoteDb.defineCollection('certificates', { fields, dryRun: true });
+```
+
+`inspectMigration` / `dryRun` exist for a deploy-time check: a refused migration is far better
+found by a pipeline than by the first write after a rollout.
 
 **Binary payloads.** After `describe()`, a client can send `payloadBin` — the collection's own
 TLV encoding — instead of `payloadJson`: same method, roughly 2.5x less on the wire.

@@ -4,7 +4,8 @@ const assert = require('node:assert');
 const path = require('node:path');
 const fsp = require('node:fs/promises');
 
-const { GrpcClient, GRPC_STATUS } = require('@fitfak/grpc');
+const { requireGrpc } = require('./helpers/require-grpc');
+const { GrpcClient, GRPC_STATUS } = requireGrpc();
 const { createDatabaseServer } = require('../src/grpc/server');
 const { createTestCaBackend, createServerIdentity, generateKeyPair } = require('./helpers/test-pki');
 
