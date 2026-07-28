@@ -41,14 +41,31 @@ function createFitfakSslCsrProvider({ ssl = null, algorithm = 'ec', namedCurve =
         };
       }
       const { publicKey, privateKey } = crypto.generateKeyPairSync('ec', { namedCurve });
+      // @fitfak/ssl EC imzalamada özel anahtarı SKALER olarak ister (BigInt),
+      // DER ya da PEM olarak değil. Aşağıdaki `privateKeyScalar` bunun için:
+      // önceden buraya privateKeyDer geçiliyordu ve imzalama, ilgisiz bir
+      // "Unknown encoding" hatasıyla düşüyordu -- bu yol paketin kendi
+      // testlerinde bir test sahtesiyle değiştirildiği için hiç çalışmamıştı.
+      const jwk = privateKey.export({ format: 'jwk' });
       return {
         keyType: 'ec',
         curveName,
         privateKey,
+        privateKeyScalar: BigInt(`0x${Buffer.from(jwk.d, 'base64url').toString('hex')}`),
         publicKey,
         privateKeyPem: privateKey.export({ type: 'pkcs8', format: 'pem' }),
         publicKeyPem: publicKey.export({ type: 'spki', format: 'pem' }),
-        publicKeyBuf: publicKey.export({ type: 'spki', format: 'der' }),
+        // @fitfak/ssl EC için HAM noktayı bekler (0x04 || X || Y), SPKI DER
+        // değil -- SPKI'yi kendisi kurar. SPKI geçirmek, içine ikinci bir SPKI
+        // gömülü bozuk bir yapı üretiyor ve sunucu tarafında "Failed to read
+        // asymmetric key" olarak patlıyordu.
+        publicKeyBuf: Buffer.concat([
+          Buffer.from([0x04]),
+          Buffer.from(jwk.x, 'base64url'),
+          Buffer.from(jwk.y, 'base64url'),
+        ]),
+        // SPKI biçimi hâlâ gerekebilir (CA backend'leri, doğrulayıcılar).
+        publicKeySpkiDer: publicKey.export({ type: 'spki', format: 'der' }),
         privateKeyDer: privateKey.export({ type: 'sec1', format: 'der' }),
       };
     },
@@ -56,7 +73,7 @@ function createFitfakSslCsrProvider({ ssl = null, algorithm = 'ec', namedCurve =
     async createCsr({ keyPair, subject, altNames = [] }) {
       const keyInfo = keyPair.keyType === 'rsa'
         ? { keyType: 'rsa', publicKeyBuf: keyPair.publicKeyBuf, privateKey: keyPair.privateKeyDer, n: keyPair.n, e: keyPair.e }
-        : { keyType: 'ec', curveName: keyPair.curveName, publicKeyBuf: keyPair.publicKeyBuf, privateKey: keyPair.privateKeyDer };
+        : { keyType: 'ec', curveName: keyPair.curveName, publicKeyBuf: keyPair.publicKeyBuf, privateKey: keyPair.privateKeyScalar };
 
       const subjectPairs = [];
       if (subject.C) subjectPairs.push([OIDs.country, subject.C]);
