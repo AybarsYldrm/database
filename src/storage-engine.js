@@ -11,7 +11,7 @@ const { AsyncQueue } = require('./async-queue');
 const { encodeIndexValue, decodeIndexValue } = require('./index-value-codec');
 const { idToBuf, bufToId } = require('./id-codec');
 const { SecondaryIndexStore } = require('./secondary-index-store');
-const { mk, NULL_LOGGER } = require('./logger');
+const { adapt } = require('./logger');
 
 // On-disk frame format, one per record mutation, appended sequentially to a segment file:
 //   [op:1][flags:1][id:8 BE][version:4 BE][payloadLen:4 BE][payload: iv(12)+tag(16)+ciphertext]
@@ -87,7 +87,10 @@ class UniqueConstraintError extends Error {
 class CollectionStorage {
   constructor({ dir, ddk, schema, segmentMaxBytes = 16 * 1024 * 1024, compress = false, cache, maxOpenReadFds = 64, cryptoOffload = null, diskFlushThreshold = 2000, onChange = null, logger = null, name = null }) {
     this.name = name || path.basename(dir || '');
-    this.log = logger ? (logger.child ? logger.child(this.name) : logger) : mk(`fitdb:storage:${this.name}`);
+    // adapt(), not the logger as given: a host logger with only info/warn/error would
+    // otherwise reach `this.log.timer(...)` in open() and throw, leaving the collection
+    // permanently unopened because someone supplied a simple logger.
+    this.log = adapt(logger, logger ? this.name : `fitdb:storage:${this.name}`);
     this.dir = dir;
     this.ddk = ddk;
     this.schema = schema; // array of {no,name,type,index?,blindIndex?,required?,diskBacked?}

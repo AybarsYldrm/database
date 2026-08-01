@@ -37,8 +37,14 @@ const BOLD = '\x1b[1m';
 // FITDB_LOG_LEVEL is the name that belongs to this package; DTLS_LOG_LEVEL is honoured too
 // so a process already running with the sibling transport's logger turned up does not have
 // to set two variables to see the same depth of detail.
-const envLevel = String(process.env.FITDB_LOG_LEVEL || process.env.DTLS_LOG_LEVEL || 'INFO').toUpperCase();
-let minLevel = LEVELS[envLevel] ?? LEVELS.INFO;
+//
+// DEBUG by default, matching the rest of the stack. INFO was the earlier default and it was
+// the wrong call: it hid every timing and every strategy decision, so the engine looked
+// silent and "where did you actually log anything?" was a fair question. Per-request lines
+// live at DEBUG, byte-level detail at TRACE, and a deployment that wants quiet sets
+// FITDB_LOG_LEVEL=INFO.
+const envLevel = String(process.env.FITDB_LOG_LEVEL || process.env.DTLS_LOG_LEVEL || 'DEBUG').toUpperCase();
+let minLevel = LEVELS[envLevel] ?? LEVELS.DEBUG;
 
 let colorEnabled = !!process.stdout.isTTY && process.env.NO_COLOR !== '1';
 let jsonMode = String(process.env.FITDB_LOG_JSON || '') === '1';
@@ -98,17 +104,23 @@ function redact(fields) {
   return out;
 }
 
-function stringifyRest(fields) {
-  const parts = [];
+/**
+ * Everything except `msg`, as an indented JSON block.
+ *
+ * This is the presentation the rest of the FITFAK stack's logger uses, and matching it is not
+ * cosmetic: a database line usually carries nested detail (a migration's change list, a
+ * failure's per-MX breakdown, a query's strategy and counts), and flattening that onto one
+ * `k=v` line is where it stops being readable exactly when it matters most.
+ */
+function metaBlock(fields) {
+  const rest = {};
   for (const [k, v] of Object.entries(fields)) {
-    if (k === 'msg') continue;
-    if (v === null) { parts.push(`${k}=null`); continue; }
-    if (Buffer.isBuffer(v)) { parts.push(`${k}=<${v.length}B>`); continue; }
-    if (typeof v === 'object') { parts.push(`${k}=${safeJson(v)}`); continue; }
-    const s = String(v);
-    parts.push(/[\s"=]/.test(s) ? `${k}="${s.replace(/"/g, '\\"')}"` : `${k}=${s}`);
+    if (k === 'msg' || v === undefined) continue;
+    rest[k] = v;
   }
-  return parts.join(' ');
+  if (Object.keys(rest).length === 0) return '';
+  try { return JSON.stringify(rest, bufReplacer, 2); }
+  catch { return String(rest); }
 }
 
 function hexDump(buf, { width = 16, indent = '  ', maxBytes = 512 } = {}) {
@@ -127,14 +139,19 @@ function hexDump(buf, { width = 16, indent = '  ', maxBytes = 512 } = {}) {
   return out.join('\n');
 }
 
-function emit(levelName, component, fields) {
+function emit(levelName, component, fields, localSink = null) {
   if (LEVELS[levelName] < minLevel) return;
   const norm = redact(fields);
 
-  if (sink) {
+  // A logger built with its own sink writes there; otherwise the module-wide one applies.
+  const target = localSink || sink;
+  if (target) {
     const method = levelName.toLowerCase();
-    const fn = typeof sink[method] === 'function' ? sink[method] : sink.info;
-    if (typeof fn === 'function') fn.call(sink, { component, ...norm });
+    // A host logger is not obliged to implement every level. Falling back to `info` keeps a
+    // debug line visible rather than throwing on a missing method, and the guard below means
+    // a logger missing even that is simply silent instead of fatal.
+    const fn = typeof target[method] === 'function' ? target[method] : target.info;
+    if (typeof fn === 'function') fn.call(target, { component, ...norm });
     return;
   }
 
@@ -148,25 +165,31 @@ function emit(levelName, component, fields) {
   const color = c(LEVEL_COLORS[levelName] || '');
   const head = `${c(DIM)}${ts()}${c(RESET)} ${color}${c(BOLD)}${levelName.padEnd(5)}${c(RESET)} ${color}[${component}]${c(RESET)}`;
   const message = norm.msg != null ? ` ${norm.msg}` : '';
-  const rest = stringifyRest(norm);
-  stream.write(`${head}${message}${rest ? ` ${c(DIM)}${rest}${c(RESET)}` : ''}\n`);
+  const meta = metaBlock(norm);
+  stream.write(`${head}${message}${meta ? `\n${c(DIM)}${meta}${c(RESET)}` : ''}\n`);
 }
 
-/** Builds a logger bound to `component`. */
-function mk(component) {
+/**
+ * Builds a logger bound to `component`.
+ *
+ * `opts.sink` routes this logger (and its children) to a host application's logger instead of
+ * stdout, without touching the module-wide sink -- which is what makes adapt() below able to
+ * wrap a caller-supplied logger per instance.
+ */
+function mk(component, { sink: localSink = null } = {}) {
   const self = {
-    trace: (a, b) => emit('TRACE', component, coerce(a, b)),
-    debug: (a, b) => emit('DEBUG', component, coerce(a, b)),
-    info: (a, b) => emit('INFO', component, coerce(a, b)),
-    warn: (a, b) => emit('WARN', component, coerce(a, b)),
-    error: (a, b) => emit('ERROR', component, coerce(a, b)),
-    child: (sub) => mk(`${component}:${sub}`),
+    trace: (a, b) => emit('TRACE', component, coerce(a, b), localSink),
+    debug: (a, b) => emit('DEBUG', component, coerce(a, b), localSink),
+    info: (a, b) => emit('INFO', component, coerce(a, b), localSink),
+    warn: (a, b) => emit('WARN', component, coerce(a, b), localSink),
+    error: (a, b) => emit('ERROR', component, coerce(a, b), localSink),
+    child: (sub) => mk(`${component}:${sub}`, { sink: localSink }),
     enabled: (lvl) => (LEVELS[String(lvl).toUpperCase()] ?? 0) >= minLevel,
 
     hex: (label, buf) => {
       if (LEVELS.DEBUG < minLevel) return;
-      emit('DEBUG', component, { msg: label, bytes: Buffer.isBuffer(buf) ? buf.length : 0 });
-      if (!sink && !jsonMode) process.stdout.write(`${hexDump(buf)}\n`);
+      emit('DEBUG', component, { msg: label, bytes: Buffer.isBuffer(buf) ? buf.length : 0 }, localSink);
+      if (!localSink && !sink && !jsonMode) process.stdout.write(`${hexDump(buf)}\n`);
     },
 
     /**
@@ -181,12 +204,37 @@ function mk(component) {
       return (fields = {}) => {
         const ms = Number(process.hrtime.bigint() - startedAt) / 1e6;
         const rounded = Math.round(ms * 100) / 100;
-        emit(ms >= warnAboveMs ? 'WARN' : 'DEBUG', component, { msg: label, ms: rounded, ...fields });
+        emit(ms >= warnAboveMs ? 'WARN' : 'DEBUG', component, { msg: label, ms: rounded, ...fields }, localSink);
         return rounded;
       };
     },
   };
   return self;
+}
+
+/** Everything the engine calls on a logger. A host logger has no reason to implement all of it. */
+const REQUIRED_METHODS = ['trace', 'debug', 'info', 'warn', 'error', 'child', 'timer', 'hex', 'enabled'];
+
+/**
+ * Turns whatever a caller supplied as `logger` into one the engine can rely on.
+ *
+ * This exists because passing a host logger straight through was a real, load-bearing bug: an
+ * application that supplied `{ info, warn, error }` -- a completely reasonable logger -- got a
+ * `this.log.timer is not a function` the moment a collection opened, and since that throw
+ * happens inside open(), the collection never became usable. A logger is diagnostic equipment;
+ * supplying a simple one must never break the thing being diagnosed.
+ *
+ * A logger that already has the full surface is used as-is (so a child of ours keeps its
+ * component path). Anything partial is wrapped: the engine gets a complete logger, and every
+ * line it writes is forwarded to the supplied one, with levels it does not implement folded
+ * onto `info`.
+ */
+function adapt(candidate, component) {
+  if (!candidate) return mk(component);
+  if (REQUIRED_METHODS.every((m) => typeof candidate[m] === 'function')) {
+    return candidate.child(component);
+  }
+  return mk(component, { sink: candidate });
 }
 
 function setLevel(name) {
@@ -226,4 +274,4 @@ const NULL_LOGGER = {
   timer() { return () => 0; },
 };
 
-module.exports = { mk, hexDump, setLevel, getLevel, setSink, configure, LEVELS, NULL_LOGGER };
+module.exports = { mk, adapt, hexDump, setLevel, getLevel, setSink, configure, LEVELS, NULL_LOGGER };

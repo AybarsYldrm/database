@@ -18,9 +18,19 @@ const path = require('node:path');
 const {
   createDatabaseServer, createSharedSecretAttestor, createRenewalAttestor,
   createCompositeAttestor, createIdpTokenAttestor, generateEnrolmentSecret,
-  createFitfakSslCaBackend,
+  createFitfakSslCaBackend, createLogger,
 } = require('..');
 const ssl = require('@fitfak/ssl');
+
+// The package's own logger, not `console`.
+//
+// `logger: console` was the previous wiring and it produced unreadable output: the engine
+// hands its lines over as structured objects, and console.info prints an object literal, so
+// every database line arrived as a raw `{ collection: 'users', msg: '...' }` dump with no
+// timestamp, no level and no component. This logger formats them the same way the rest of the
+// stack does -- `HH:MM:SS.mmm LEVEL [component] message` with the detail indented beneath --
+// and honours FITDB_LOG_LEVEL (TRACE/DEBUG/INFO/WARN/ERROR; DEBUG by default).
+const log = createLogger('db');
 
 // ---------------------------------------------------------------------------------------------
 // Configuration
@@ -94,7 +104,7 @@ if (CA_FILES.every((f) => fs.existsSync(statePath(f)))) {
     root: readCaPart('root-ca.key', 'root-ca.crt'),
     intermediate: readCaPart('sub-ca.key', 'sub-ca.crt'),
   });
-  console.log('[db] CA loaded from disk.');
+  log.info({ msg: 'CA loaded from disk' });
 } else {
   ca = ssl.CertificateAuthority.create({
     keyAlgo: 'ec', curveName: 'P-256',
@@ -102,7 +112,7 @@ if (CA_FILES.every((f) => fs.existsSync(statePath(f)))) {
   });
   writeCaPart(ca.root, 'root-ca.key', 'root-ca.crt');
   writeCaPart(ca.intermediate, 'sub-ca.key', 'sub-ca.crt');
-  console.log('[db] new CA generated and written to disk.');
+  log.warn({ msg: 'new CA generated and written to disk' });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -134,7 +144,7 @@ let serverChainPem;
 if (serverCertificateIsUsable()) {
   serverKeyPem = fs.readFileSync(statePath(SERVER_KEY_FILE), 'utf8');
   serverChainPem = fs.readFileSync(statePath(SERVER_CRT_FILE), 'utf8');
-  console.log('[db] server certificate loaded from disk.');
+  log.info({ msg: 'server certificate loaded from disk' });
 } else {
   const serverKey = ssl.generateEcKeyPair('P-256');
   const serverCsr = ssl.generateCSR(
@@ -152,7 +162,7 @@ if (serverCertificateIsUsable()) {
   serverChainPem = `${[serverCert.pem.trim(), ca.getIntermediatePem().trim()].join('\n')}\n`;
   fs.writeFileSync(statePath(SERVER_KEY_FILE), serverKeyPem, { mode: 0o600 });
   fs.writeFileSync(statePath(SERVER_CRT_FILE), serverChainPem, { mode: 0o644 });
-  console.log('[db] new server certificate issued and written to disk.');
+  log.warn({ msg: 'new server certificate issued and written to disk' });
 }
 
 const serverTlsOptions = {
@@ -231,7 +241,7 @@ console.log('');
 const server = createDatabaseServer({
   baseDir: DATA_DIR,
   principals,
-  logger: console,
+  logger: log,
   enrollment: {
     caBackend: createFitfakSslCaBackend({ ca, ssl }),
     serverName: SERVER_DNS[0] || 'localhost',
@@ -262,18 +272,18 @@ const server = createDatabaseServer({
   },
 });
 
-server.on('enrolled', (event) => console.log(`[db] issued '${event.principal}' via ${event.method}`));
-server.on('enrolmentDenied', (event) => console.warn(`[db] enrolment denied for '${event.serviceName}': ${event.reason}`));
-server.on('databaseCreated', (event) => console.log(`[db] '${event.by}' created database ${event.dbId}`));
+// Enrolment and database-creation events are logged by the server itself now; these remain as
+// the place to hook deployment-specific reactions (paging, an audit sink) onto them.
 
 // A failed client handshake -- a service with an expired certificate, a probe from elsewhere on
-// the network -- must be a log line, not a dead server.
-server.app.on('clientError', (err) => console.warn(`[db] TLS client error: ${err.message}`));
-server.app.on('sessionError', (err) => console.warn(`[db] HTTP/2 session error: ${err.message}`));
-server.app.on('error', (err) => console.error('[db] server error:', err));
+// the network -- must be a log line, not a dead server. These are the lines to read first when
+// a client reports that it cannot connect.
+server.app.on('clientError', (err) => log.warn({ error: err.message, msg: 'TLS client error' }));
+server.app.on('sessionError', (err) => log.warn({ error: err.message, msg: 'HTTP/2 session error' }));
+server.app.on('error', (err) => log.error({ error: err.message, stack: err.stack, msg: 'server error' }));
 
 server.listen(PORT, { host: HOST, tls: serverTlsOptions });
-console.log(`[db] listening on ${HOST}:${PORT} (data: ${DATA_DIR}, state: ${STATE_DIR})`);
+log.info({ dataDir: DATA_DIR, stateDir: STATE_DIR, msg: 'state directories' });
 
 // Flush every open database's index snapshot before exiting. Without this the next start
 // replays segments from the last snapshot instead of resuming from a clean one -- correct
@@ -283,8 +293,9 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
   process.on(signal, async () => {
     if (shuttingDown) return;
     shuttingDown = true;
-    console.log(`\n[db] ${signal} received, closing...`);
-    try { await server.close({ graceMs: 5000 }); } catch (err) { console.error('[db] close failed:', err); }
+    log.info({ signal, msg: 'shutting down' });
+    try { await server.close({ graceMs: 5000 }); }
+    catch (err) { log.error({ error: err.message, msg: 'close failed' }); }
     process.exit(0);
   });
 }
@@ -292,4 +303,8 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
 // An unhandled rejection defaults to killing the process in current Node. For a database that
 // several services depend on, taking the whole thing down over one bad request is worse than
 // logging it and staying up.
-process.on('unhandledRejection', (reason) => console.error('[db] unhandled rejection:', reason));
+process.on('unhandledRejection', (reason) => log.error({
+  error: reason instanceof Error ? reason.message : String(reason),
+  stack: reason instanceof Error ? reason.stack : undefined,
+  msg: 'unhandled rejection',
+}));

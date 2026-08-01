@@ -11,6 +11,7 @@ const { SnowflakeGenerator } = require('../snowflake');
 const { CHANGE_OPS } = require('../change-stream');
 const { DATABASE_SCHEMAS, WATCH_EVENTS, DB_SERVICE_NAME } = require('./schemas');
 const { createPrincipalResolver, requirePermission } = require('./identity');
+const { adapt, getLevel } = require('../logger');
 const { toJson, readPayload, writePayload, recordToJsonObject, recordsToJson } = require('./record-codec');
 
 // The database as a gRPC service.
@@ -76,7 +77,10 @@ class DatabaseServer extends EventEmitter {
     // expired can be transparently reopened instead of failing a request that was legitimate
     // a minute ago. Held in memory only, and only for databases this process actually serves.
     this._secrets = new Map(); // dbId -> { secret, ownerId }
-    this._log = log || null;
+    // Adapted, not used as given: `logger: console` is a completely reasonable thing to pass
+    // and `console` has no child()/timer(). Going through adapt() means the server gets the
+    // full surface while the caller's logger still receives every line.
+    this._log = adapt(log, 'fitdb:server');
 
     this.app = options.app || new GrpcApplication({
       packageName: this.options.packageName,
@@ -110,6 +114,10 @@ class DatabaseServer extends EventEmitter {
       : createEnrollmentService({ logger: this._log, ...enrollment });
 
     this.enrollment = service;
+    this._enrolmentEnabled = true;
+    // Issuance and refusal are logged by the enrolment service itself, which is given this
+    // server's logger above -- it holds the detail (kind, method, reason), so logging here
+    // too would only print each event twice.
     service.events.on('issued', (event) => this.emit('enrolled', event));
     service.events.on('denied', (event) => this.emit('enrolmentDenied', event));
     this.app.registerController(enrollment.serviceName || 'EnrollmentService', service.controller);
@@ -223,7 +231,7 @@ class DatabaseServer extends EventEmitter {
       responseType: `${service}_${name}Res`,
     });
 
-    this.app.registerController(service, {
+    const controller = {
       WhoAmI: {
         ...method('WhoAmI'),
         handler: async (req, call) => {
@@ -252,7 +260,7 @@ class DatabaseServer extends EventEmitter {
           if (self.options.autoGrantOwner && ownerId !== principal.id) db.acl.grant(principal.id, DB_PERMISSIONS.ADMIN);
           self._secrets.set(dbId, { secret: Buffer.from(clientSecret, 'base64'), ownerId });
           self.emit('databaseCreated', { dbId, ownerId, by: principal.id });
-          self._log?.info?.(`[db] '${principal.id}' created database ${dbId} ('${req.name}')`);
+          self._log.info({ principal: principal.id, dbId, name: req.name, ownerId, msg: 'database created' });
 
           // The only time this secret exists anywhere outside the caller's hands. It is not
           // written to disk, not logged, and cannot be recovered if the caller loses it.
@@ -268,7 +276,11 @@ class DatabaseServer extends EventEmitter {
           const database = await self._open({
             dbId: req.dbId, ownerId: req.ownerId, clientSecret: req.clientSecret, principal,
           });
-          self._log?.info?.(`[db] '${principal.id}' opened database ${req.dbId}`);
+          self._log.info({
+            principal: principal.id, dbId: req.dbId,
+            collections: database.listCollections(),
+            msg: 'database opened',
+          });
           return {
             message: `database '${database.name}' is open`,
             dbId: req.dbId,
@@ -356,10 +368,20 @@ class DatabaseServer extends EventEmitter {
             self.emit('collectionMigrated', {
               dbId: req.dbId, collection: req.collection, by: principal.id, changes: migration.changes,
             });
-            self._log?.info?.(`[db] '${principal.id}' migrated ${req.collection}: `
-              + migration.changes.map((c) => `${c.kind}(${c.field})`).join(', '));
+            self._log.info({
+              principal: principal.id, dbId: req.dbId, collection: req.collection,
+              changes: migration.changes.map((c) => `${c.kind}(${c.field})`),
+              indexesRebuilt: !!migration.rebuilt,
+              schemaVersion: migration.schemaVersion,
+              msg: 'collection migrated',
+            });
           } else if (created) {
             self.emit('collectionDefined', { dbId: req.dbId, collection: req.collection, by: principal.id });
+            self._log.info({
+              principal: principal.id, dbId: req.dbId, collection: req.collection,
+              fields: (req.fields || []).length || undefined,
+              msg: 'collection defined',
+            });
           }
 
           return {
@@ -632,9 +654,66 @@ class DatabaseServer extends EventEmitter {
           return { mask: database.acl.maskFor(req.principal) };
         },
       },
-    });
+    };
 
+    this.app.registerController(service, this._instrument(controller));
     return this;
+  }
+
+  /**
+   * Wraps every handler so one line describes each request: who asked, what for, on which
+   * database and collection, how long it took, and how it ended.
+   *
+   * Done here rather than in each of the twenty-odd handlers because per-handler logging is
+   * exactly the kind that gets added to three of them and forgotten everywhere else. This is
+   * also the layer where a failure is still a GrpcError with its status code intact -- by the
+   * time it reaches the transport it is a wire frame, and the reason is gone.
+   *
+   * Successful calls log at DEBUG (a busy server should not narrate itself at INFO), refusals
+   * at WARN, and anything unexpected at ERROR with its stack.
+   */
+  _instrument(controller) {
+    const log = this._log;
+    if (!log || typeof log.debug !== 'function') return controller;
+
+    const out = {};
+    for (const [name, definition] of Object.entries(controller)) {
+      if (typeof definition.handler !== 'function') { out[name] = definition; continue; }
+      const inner = definition.handler;
+      out[name] = {
+        ...definition,
+        handler: async (req, call) => {
+          const startedAt = Date.now();
+          // The principal may not resolve yet (WhoAmI on a half-set-up peer); never let
+          // logging be the thing that fails a request.
+          let who = '?';
+          try { who = this._principal(call).id; } catch { /* leave unknown */ }
+          const context = {
+            rpc: name,
+            principal: who,
+            dbId: req?.dbId || undefined,
+            collection: req?.collection || undefined,
+          };
+          try {
+            const result = await inner(req, call);
+            log.debug({ ...context, ms: Date.now() - startedAt, msg: 'rpc ok' });
+            return result;
+          } catch (err) {
+            const ms = Date.now() - startedAt;
+            if (err instanceof GrpcError) {
+              // An expected refusal: wrong secret, no ACL entry, unknown collection, a
+              // migration the caller's schema does not permit. The status code is the useful
+              // part and it is only available here.
+              log.warn({ ...context, ms, status: err.code, error: err.message, msg: 'rpc refused' });
+            } else {
+              log.error({ ...context, ms, error: err.message, stack: err.stack, msg: 'rpc failed' });
+            }
+            throw err;
+          }
+        },
+      };
+    }
+    return out;
   }
 
   _read(collection, req) {
@@ -801,7 +880,32 @@ class DatabaseServer extends EventEmitter {
         + '{ key, cert, ca, requestCert: true }.',
       );
     }
-    return this.app.listen(port, { host: this.options.host || '0.0.0.0', ...options, tls });
+    const result = this.app.listen(port, { host: this.options.host || '0.0.0.0', ...options, tls });
+
+    // What a reader of the log needs at startup: where it is listening, whether enrolment is
+    // reachable at all, and where the data lives. Previously the server said nothing on its
+    // own -- every startup line came from the example script.
+    //
+    // Deferred to the socket's own 'listening' event rather than logged straight after
+    // listen() returns: bind is asynchronous, so address() is not populated yet and `port: 0`
+    // (the "pick one for me" request, not the port actually chosen) is what gets printed.
+    const announce = () => this._log.info({
+      host: this.options.host || '0.0.0.0',
+      port: this.address()?.port ?? port,
+      baseDir: this.options.baseDir,
+      enrolment: this._enrolmentEnabled ? 'enabled' : 'disabled',
+      principals: Object.keys(this.options.principals || {}),
+      logLevel: getLevel(),
+      msg: 'database server listening',
+    });
+    const socket = this.app.server?.server;
+    if (socket && typeof socket.once === 'function' && typeof socket.listening === 'boolean') {
+      if (socket.listening) announce();
+      else socket.once('listening', announce);
+    } else {
+      announce();
+    }
+    return result;
   }
 
   /**

@@ -141,6 +141,58 @@ async function main() {
   console.log('tail-replay recovery after unclean shutdown OK:', recoveredAfterCrash);
 
   await manager3.closeDatabase(dbId);
+
+  // 14) a host application's own logger must not be able to break the engine.
+  //
+  // Passing a caller-supplied logger straight through to the storage layer meant an
+  // application that supplied a perfectly ordinary { info, warn, error } hit
+  // "this.log.timer is not a function" the moment a collection opened -- and because that
+  // throw happens inside open(), the collection stayed permanently unusable. Diagnostic
+  // equipment must never break the thing it is there to observe, so anything partial is
+  // adapted rather than trusted.
+  {
+    const forwarded = [];
+    const hostLogger = {
+      info: (o) => forwarded.push(o),
+      warn: (o) => forwarded.push(o),
+      error: (o) => forwarded.push(o),
+      // deliberately no child(), timer(), hex() or enabled()
+    };
+
+    const managerL = new DatabaseManager({ baseDir, logger: hostLogger });
+    const createdL = await managerL.createDatabase({ ownerId: 'logger-owner', name: 'logged' });
+    const logged = await createdL.db.defineCollectionAsync('entries', {
+      fields: [
+        { no: 2, name: 'label', type: 'string', index: true },
+        { no: 3, name: 'at', type: 'uint64', rangeBucket: { width: 60000 } },
+      ],
+    });
+
+    const failed = forwarded.filter((o) => o && /failed to open/.test(String(o.msg || '')));
+    assert.strictEqual(failed.length, 0,
+      `a partial host logger must not stop a collection opening: ${JSON.stringify(failed[0] || {})}`);
+
+    const loggedId = await logged.insert({ label: 'first', at: Date.now() });
+    assert.strictEqual((await logged.get(loggedId)).label, 'first');
+    assert.strictEqual((await logged.findRange('at', 0, Date.now())).length, 1,
+      'the range sweep also calls timer(), so it must survive a partial logger too');
+
+    // Reopen exercises replay and index rebuild, which are timed as well.
+    await managerL.closeDatabase(createdL.dbId);
+    const managerL2 = new DatabaseManager({ baseDir, logger: hostLogger });
+    const dbL2 = await managerL2.openDatabase({
+      ownerId: 'logger-owner', dbId: createdL.dbId, requesterId: 'logger-owner',
+      keyProvider: new ClientSecretKeyProvider(Buffer.from(createdL.clientSecret, 'base64')),
+    });
+    assert.ok(await dbL2.collection('entries').get(loggedId), 'reopen must work under a partial logger');
+    await managerL2.closeDatabase(createdL.dbId);
+
+    assert.ok(forwarded.length > 0, 'engine lines must actually reach the supplied logger');
+    assert.ok(forwarded.every((o) => typeof o === 'object' && o !== null),
+      'forwarded lines keep the object shape a host logger expects');
+    console.log(`partial host logger: collection opened, ${forwarded.length} line(s) forwarded`);
+  }
+
   console.log('\nALL BASIC-USAGE CHECKS PASSED');
 }
 

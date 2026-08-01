@@ -10,7 +10,7 @@ const { AccessControlList, DB_PERMISSIONS } = require('./rbac');
 const { deriveManifestKeyFromKek, randomKey, wrapKey, unwrapKey, aesGcmEncrypt, aesGcmDecrypt } = require('./crypto-core');
 const { ClientSecretKeyProvider, randomClientSecret } = require('./key-provider');
 const { Database } = require('./database');
-const { mk } = require('./logger');
+const { adapt } = require('./logger');
 
 // Manifest = small, infrequently-read structural metadata (schema definitions, ACL, wrapped
 // DDK). Encrypted as a whole with AES-256-GCM under manifestKey, plaintext JSON before
@@ -21,7 +21,7 @@ const { mk } = require('./logger');
 class DatabaseManager {
   constructor({ baseDir, snowflake, sessionTtlMs = 15 * 60 * 1000, logger = null }) {
     this.baseDir = baseDir;
-    this.log = logger || mk('fitdb:manager');
+    this.log = adapt(logger, 'fitdb:manager');
     this.snowflake = snowflake || new SnowflakeGenerator();
     this.sessionTtlMs = sessionTtlMs;
     this.sessions = new Map(); // dbId -> { ddk, timer }
