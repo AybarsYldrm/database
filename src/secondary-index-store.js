@@ -82,6 +82,31 @@ class SecondaryIndexStore {
     return result;
   }
 
+  /**
+   * Every live key -> id-set in this store, memtable and disk segment merged, tombstones
+   * applied. The full-store counterpart to range(), for a caller that has decided scanning
+   * everything is cheaper than probing keys one at a time (see the sweep strategy in
+   * CollectionStorage.lookupRangeCandidates).
+   */
+  async entries() {
+    const result = new Map();
+    if (this.diskSegment) {
+      for await (const [key, ids] of this.diskSegment.entries()) result.set(key, new Set(ids));
+    }
+    for (const [key, ids] of this.memtable) {
+      if (!result.has(key)) result.set(key, new Set());
+      const target = result.get(key);
+      for (const id of ids) target.add(id);
+    }
+    for (const [key, tombstoned] of this.tombstones) {
+      const live = result.get(key);
+      if (!live) continue;
+      for (const id of tombstoned) live.delete(id);
+      if (live.size === 0) result.delete(key);
+    }
+    return result;
+  }
+
   needsFlush() { return this.memtable.size + this.tombstones.size >= this.flushThreshold; }
 
   async flush() {

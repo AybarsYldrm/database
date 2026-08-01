@@ -155,6 +155,11 @@ const DATABASE_SCHEMAS = {
     // false: bucketed blind index (hides order, needs a post-decrypt filter)
     // true:  plain disk-backed ordered scan (server learns real value order)
     { no: 6, name: 'plain', type: 'bool' },
+    // Caps how many matching records come back. Without it an open-ended range ("everything
+    // due by now") makes the server decrypt and serialize the entire matching set into one
+    // message, which both wastes the work the caller was going to discard and can push the
+    // response past the transport's per-message limit. Absent/0 means the server's default.
+    { no: 7, name: 'limit', type: 'int32' },
   ],
   [`${DB}_FindRangeRes`]: [
     { no: 1, name: 'payloadJson', type: 'string' },

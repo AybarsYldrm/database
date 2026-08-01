@@ -64,6 +64,60 @@ async function main() {
   assert.strictEqual(afterReopen.length, expectedCount);
   console.log('range index correctly persisted and reloaded across a clean close/reopen');
 
+  // ── An open-ended range must not cost anything proportional to the range ───────────────
+  //
+  // This is the regression that took the whole database down. `findRange(field, 0, now)` --
+  // the natural spelling of "everything due by now" -- used to walk one bucket at a time from
+  // the epoch to the present, hashing each bucket number. On a minute-width field that is
+  // ~30 million synchronous HMACs, roughly two minutes with the event loop held the entire
+  // time, so no other client of the database was served either. A single row was enough to
+  // trigger it; an EMPTY collection was fast, which is why deleting the data appeared to fix
+  // it and why it came straight back on the next insert.
+  //
+  // Both properties are asserted: the answer is still exact, and it arrives quickly.
+  const MINUTE = 60_000;
+  const queue = await db2.defineCollectionAsync('due_queue', {
+    fields: [
+      { no: 2, name: 'queueId', type: 'string', index: true },
+      { no: 3, name: 'nextAttemptAt', type: 'uint64', rangeBucket: { width: MINUTE } },
+    ],
+  });
+
+  const now = Date.now();
+  await queue.insert({ queueId: 'due-now', nextAttemptAt: now - 1000 });
+  await queue.insert({ queueId: 'due-earlier', nextAttemptAt: now - 90 * MINUTE });
+  await queue.insert({ queueId: 'not-due-yet', nextAttemptAt: now + 60 * MINUTE });
+
+  const openEndedStart = Date.now();
+  const due = await queue.findRange('nextAttemptAt', 0, now);
+  const openEndedMs = Date.now() - openEndedStart;
+
+  assert.strictEqual(due.length, 2, 'an open-ended range must still return exactly the due rows');
+  assert.ok(
+    due.every((r) => Number(r.nextAttemptAt) <= now),
+    'the exact filter still applies, even though candidates came from a whole-field sweep',
+  );
+  assert.ok(
+    openEndedMs < 5000,
+    `findRange(0, now) took ${openEndedMs}ms; it must not scale with the width of the range `
+    + '(before the bucket-probe budget existed this was ~120000ms and blocked the event loop throughout)',
+  );
+  console.log(`open-ended range (${Math.floor(now / MINUTE).toLocaleString()} buckets wide) answered in ${openEndedMs}ms with ${due.length} exact matches`);
+
+  // The limit stops the decrypt loop early rather than being applied to a fully built result.
+  const limited = await queue.findRange('nextAttemptAt', 0, now, { limit: 1 });
+  assert.strictEqual(limited.length, 1, 'limit must cap the number of records returned');
+  console.log('limit is honoured on an open-ended range');
+
+  // A non-numeric bound used to produce NaN buckets and silently return nothing, which reads
+  // exactly like "no matching rows" at the call site.
+  await assert.rejects(
+    () => queue.findRange('nextAttemptAt', undefined, now),
+    /numeric bounds/,
+    'a non-numeric bound must be reported, not silently answered with an empty set',
+  );
+  console.log('non-numeric bounds are rejected instead of silently returning nothing');
+
   await manager2.closeDatabase(dbId);
   console.log('\nALL RANGE-QUERY CHECKS PASSED');
 }

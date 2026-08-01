@@ -11,6 +11,7 @@ const { AsyncQueue } = require('./async-queue');
 const { encodeIndexValue, decodeIndexValue } = require('./index-value-codec');
 const { idToBuf, bufToId } = require('./id-codec');
 const { SecondaryIndexStore } = require('./secondary-index-store');
+const { mk, NULL_LOGGER } = require('./logger');
 
 // On-disk frame format, one per record mutation, appended sequentially to a segment file:
 //   [op:1][flags:1][id:8 BE][version:4 BE][payloadLen:4 BE][payload: iv(12)+tag(16)+ciphertext]
@@ -29,6 +30,33 @@ const FLAG_COMPRESSED = 0x01;
 
 const SNAPSHOT_MAGIC = Buffer.from('FDBX');
 const SNAPSHOT_VERSION = 4; // bumped: snapshot now also persists rangeBucket index tables
+
+// The most discrete rangeBucket keys a single range query will ever probe.
+//
+// This constant exists because its absence took the whole process down. `lookupRangeCandidates`
+// walks one bucket at a time from min to max, hashing each bucket number into its blind key, so
+// its cost is set by the WIDTH OF THE RANGE, not by how much data is stored. A caller asking the
+// natural question "everything due by now" -- findRange(field, 0, Date.now()) -- on a field
+// bucketed by the minute asks for floor(Date.now() / 60000) buckets: just under thirty million
+// HMACs, none of which await anything on the in-memory path, so the event loop is held for over
+// two minutes per call with a single row in the collection.
+//
+// What that looked like from the outside is worth recording, because it is nothing like "a slow
+// query": every other client of the database stopped being served, the queue's next poll piled
+// up behind the one still running, and a restart changed nothing -- the first poll after boot
+// hit the same call. Only an EMPTY collection was fast, because the field's bucket map does not
+// exist until the first row is written and the lookup returned early. Deleting the database
+// therefore "fixed" it, right up until the next message was enqueued.
+//
+// Past this many buckets, probing is abandoned for a scan of the field's populated buckets
+// (see the fallback in lookupRangeCandidates), which is bounded by how much data actually
+// exists rather than by how wide the caller's range happens to be.
+const MAX_PROBED_BUCKETS = 4096;
+
+// How many buckets to probe between yields to the event loop. Even a within-budget probe
+// should not be an uninterruptible unit of work: a database that answers nothing at all while
+// one query runs is the failure this whole area is about.
+const PROBE_YIELD_INTERVAL = 512;
 
 function segFileName(segId) { return `seg-${String(segId).padStart(6, '0')}.log`; }
 
@@ -57,7 +85,9 @@ class UniqueConstraintError extends Error {
 }
 
 class CollectionStorage {
-  constructor({ dir, ddk, schema, segmentMaxBytes = 16 * 1024 * 1024, compress = false, cache, maxOpenReadFds = 64, cryptoOffload = null, diskFlushThreshold = 2000, onChange = null }) {
+  constructor({ dir, ddk, schema, segmentMaxBytes = 16 * 1024 * 1024, compress = false, cache, maxOpenReadFds = 64, cryptoOffload = null, diskFlushThreshold = 2000, onChange = null, logger = null, name = null }) {
+    this.name = name || path.basename(dir || '');
+    this.log = logger ? (logger.child ? logger.child(this.name) : logger) : mk(`fitdb:storage:${this.name}`);
     this.dir = dir;
     this.ddk = ddk;
     this.schema = schema; // array of {no,name,type,index?,blindIndex?,required?,diskBacked?}
@@ -109,6 +139,7 @@ class CollectionStorage {
   }
 
   async _openOnce() {
+    const done = this.log.timer('open', { warnAboveMs: 2000 });
     await fsp.mkdir(this.dir, { recursive: true });
 
     // Disk-backed fields (diskBacked:true) get their own independent, persistent
@@ -144,6 +175,14 @@ class CollectionStorage {
         resumeOffset = parsed.lastOffset;
         haveSnapshot = true;
       } catch (e) {
+        // A discarded snapshot is not a harmless detail: it turns a fast open into a full
+        // replay of every segment, and if it happens on EVERY open something is durably wrong
+        // (a half-written snapshot, a version the binary no longer understands). Silence here
+        // is what made "why does startup take minutes now" unanswerable.
+        this.log.warn({
+          error: e.message,
+          msg: 'index snapshot unusable, falling back to a full segment replay',
+        });
         this.index = new Map(); // corrupt/incompatible snapshot -> fall back to a full replay
       }
     }
@@ -169,6 +208,13 @@ class CollectionStorage {
 
     if (!haveSnapshot) await this._rebuildSecondaryIndexes();
     this._opened = true;
+    done({
+      records: this.liveCount(),
+      segments: segNumbers.length,
+      resumedFromSnapshot: haveSnapshot,
+      diskBackedFields: this.diskStores.size,
+      msg: 'collection open',
+    });
     return this;
   }
 
@@ -418,14 +464,21 @@ class CollectionStorage {
   }
 
   async _rebuildSecondaryIndexes() {
+    // One decrypt per live record. Timed because on a large collection this is the single
+    // slowest thing an open can do, and it is worth being able to attribute a slow start to
+    // it rather than guessing.
+    const done = this.log.timer('rebuild secondary indexes', { warnAboveMs: 2000 });
     this.secondary.clear();
     this.blind.clear();
     this.rangeBuckets.clear();
+    let rebuilt = 0;
     for (const [idStr, loc] of this.index) {
       if (loc.deleted) continue;
       const obj = await this._readAt(idStr, loc);
       await this._indexInsertOnly(idStr, obj);
+      rebuilt++;
     }
+    done({ records: rebuilt });
   }
 
   /**
@@ -865,26 +918,81 @@ class CollectionStorage {
     return out;
   }
 
-  // Gathers candidate ids from every bucket overlapping [min,max] -- necessary but not
-  // sufficient membership (a bucket can contain values outside the exact range near its
-  // edges), so the caller (Collection.findRange) still applies an exact filter after
-  // decrypting each candidate.
+  /**
+   * Gathers candidate ids for values in [min,max] on a `rangeBucket` field.
+   *
+   * Membership is NECESSARY BUT NOT SUFFICIENT and always has been: a bucket is coarser than
+   * the range, so ids near either edge can fall outside it. Every caller is therefore already
+   * required to apply an exact filter after decrypting (Collection.findRange does). That
+   * contract is what makes the second strategy below legitimate -- returning a superset is a
+   * performance decision, never a correctness one.
+   *
+   * TWO STRATEGIES, CHOSEN BY WHICH IS ACTUALLY CHEAPER:
+   *
+   *   probe  -- hash each bucket number in the range and look it up. Cost is proportional to
+   *             the WIDTH OF THE RANGE and independent of how much data exists. Right for an
+   *             ordinary bounded query ("certificates expiring in the next 30 days").
+   *
+   *   sweep  -- hand back every id the field has indexed, in any bucket, and let the caller's
+   *             exact filter do the rest. Cost is proportional to HOW MUCH DATA EXISTS and
+   *             independent of the range width. Right for the open-ended query that the probe
+   *             strategy cannot survive: "everything due by now", where min is 0 and the range
+   *             spans every bucket since the epoch.
+   *
+   * The old code only had `probe`, with no ceiling, which is the defect described at
+   * MAX_PROBED_BUCKETS: findRange(field, 0, Date.now()) on a minute-width field meant ~30
+   * million synchronous HMACs and a two-minute event-loop stall per call.
+   */
   async lookupRangeCandidates(fieldName, min, max) {
     const field = this.schema.find((f) => f.name === fieldName);
     if (!field) throw new Error(`fitdb: no such field '${fieldName}'`);
     if (!field.rangeBucket) throw new Error(`fitdb: field '${fieldName}' has no rangeBucket configured`);
+
     const width = field.rangeBucket.width;
     const minBucket = Math.floor(Number(min) / width);
     const maxBucket = Math.floor(Number(max) / width);
-    const rangeKey = this._rangeKeyFor(fieldName);
+    const out = new Set();
+    // A NaN bound (undefined, null, a non-numeric string) used to produce NaN buckets, and
+    // `for (let b = NaN; b <= NaN; b++)` silently yields nothing -- an empty result for what is
+    // really a caller bug. An inverted range is likewise empty, but legitimately so.
+    if (!Number.isFinite(minBucket) || !Number.isFinite(maxBucket)) {
+      throw new Error(`fitdb: findRange on '${fieldName}' needs numeric bounds (got ${min} .. ${max})`);
+    }
+    if (maxBucket < minBucket) return out;
+
     const diskStore = field.diskBacked ? this.diskStores.get(fieldName) : null;
     const fieldMap = diskStore ? null : this.rangeBuckets.get(fieldName);
-    const out = new Set();
     if (!diskStore && !fieldMap) return out;
+
+    const spanBuckets = maxBucket - minBucket + 1;
+
+    if (spanBuckets > MAX_PROBED_BUCKETS) {
+      // The range is wide enough that probing it costs more than looking at everything stored.
+      // Reported at DEBUG rather than swallowed: a caller who did NOT mean "scan the field"
+      // (say, a bucket width accidentally set to milliseconds) should be able to see that this
+      // is what their query turned into.
+      const done = this.log.timer('range sweep', { warnAboveMs: 250 });
+      const all = diskStore ? await diskStore.entries() : fieldMap;
+      for (const ids of all.values()) for (const id of ids) out.add(id);
+      done({
+        field: fieldName,
+        spanBuckets,
+        strategy: 'sweep',
+        buckets: all.size,
+        candidates: out.size,
+        msg: 'range wider than the probe budget; swept the field\'s populated buckets instead',
+      });
+      return out;
+    }
+
+    const rangeKey = this._rangeKeyFor(fieldName);
+    let probed = 0;
     for (let b = minBucket; b <= maxBucket; b++) {
       const hex = blindIndexValue(rangeKey, String(b)).toString('hex');
       const ids = diskStore ? await diskStore.get(hex) : fieldMap.get(hex);
       if (ids) for (const id of ids) out.add(id);
+      // Long probes stay interruptible so concurrent readers keep being served.
+      if (++probed % PROBE_YIELD_INTERVAL === 0) await new Promise((resolve) => setImmediate(resolve));
     }
     return out;
   }
@@ -963,6 +1071,12 @@ class CollectionStorage {
       this.activeWriteFd = await fsp.open(newPath, 'a');
 
       await this._writeSnapshot();
+      this.log.info({
+        liveRecords: newIndex.size,
+        segmentsReclaimed: oldSegIds.size,
+        bytes: writeOffset,
+        msg: 'compaction complete',
+      });
       return { liveRecords: newIndex.size, segmentsReclaimed: oldSegIds.size };
     });
   }

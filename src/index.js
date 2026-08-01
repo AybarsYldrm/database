@@ -30,6 +30,7 @@ const { ChangeHub, ReplicatedView, CHANGE_OPS } = require('./change-stream');
 const { diffSchemas, planMigration, describeBlockers, SchemaMigrationError, SAFETY: MIGRATION_SAFETY } = require('./schema-migration');
 const { SecretStore, SECRETS_SCHEMA_FIELDS, SECRET_KINDS, SECRET_STATES } = require('./secret-store');
 const { DnsStore, ZoneCache, DNS_RECORDS_SCHEMA_FIELDS, DNS_RECORD_TYPES } = require('./dns-store');
+const logger = require('./logger');
 
 module.exports = {
   SnowflakeGenerator,
@@ -55,4 +56,10 @@ module.exports = {
   diffSchemas, planMigration, describeBlockers, SchemaMigrationError, MIGRATION_SAFETY,
   SecretStore, SECRETS_SCHEMA_FIELDS, SECRET_KINDS, SECRET_STATES,
   DnsStore, ZoneCache, DNS_RECORDS_SCHEMA_FIELDS, DNS_RECORD_TYPES,
+  // Structured logging. `logger.configure({ sink })` hands every engine line to a host
+  // application's logger, which is how @fitfak/smtp gets database internals in its own stream.
+  logger,
+  createLogger: logger.mk,
+  configureLogging: logger.configure,
+  LOG_LEVELS: logger.LEVELS,
 };

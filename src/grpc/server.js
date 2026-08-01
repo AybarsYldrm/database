@@ -55,6 +55,11 @@ class DatabaseServer extends EventEmitter {
       baseDir: this.options.baseDir,
       snowflake: this.snowflake,
       sessionTtlMs: this.options.sessionTtlMs,
+      // Without this the engine logged to its own default destination while the server logged
+      // to the operator's -- so the lines that explain a slow or failing request (a discarded
+      // snapshot, a whole-field sweep, a collection that never opened) never appeared next to
+      // the request they belonged to.
+      logger: this.options.logger || undefined,
     });
 
     this.capabilityKeys = options.capabilityKeyRing || new CapabilityKeyRing();
@@ -508,10 +513,11 @@ class DatabaseServer extends EventEmitter {
           if (!Number.isFinite(min) || !Number.isFinite(max)) {
             throw new GrpcError(GRPC_STATUS.INVALID_ARGUMENT, 'min and max must be numeric');
           }
+          const limit = clamp(req.limit || self.options.maxFindLimit, 1, self.options.maxFindLimit);
           try {
             const records = req.plain
-              ? await collection.findRangePlain(req.field, min, max)
-              : await collection.findRange(req.field, min, max);
+              ? await collection.findRangePlain(req.field, min, max, { limit })
+              : await collection.findRange(req.field, min, max, { limit });
             return { payloadJson: recordsToJson(collection.schema, records), count: records.length };
           } catch (err) {
             throw new GrpcError(GRPC_STATUS.INVALID_ARGUMENT, err.message);
