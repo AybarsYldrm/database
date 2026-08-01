@@ -416,7 +416,48 @@ async function main() {
     check('a breaking change is refused over the wire too', true);
   }
 
-  console.log('\n[12] Capability tokens may only narrow authority');
+  console.log('\n[12] An open-ended range query over the wire');
+  {
+    // The remote path is how @fitfak/smtp's outbound queue actually asks "what is due
+    // now?", and it is where the engine's unbounded bucket probe took the whole server
+    // down: findRange(field, 0, Date.now()) on a minute-width field walked ~30 million
+    // buckets synchronously, so the gRPC server answered nothing at all -- to every
+    // client, not just the one that asked -- for over two minutes per call.
+    const MINUTE = 60_000;
+    await db.defineCollection('giden_kuyruk', {
+      fields: [
+        { no: 2, name: 'queueId', type: 'string', index: true },
+        { no: 3, name: 'nextAttemptAt', type: 'int64', rangeBucket: { width: MINUTE } },
+      ],
+    });
+    const queue = db.collection('giden_kuyruk');
+
+    const now = Date.now();
+    await queue.insert({ queueId: 'due-a', nextAttemptAt: now - 1000 });
+    await queue.insert({ queueId: 'due-b', nextAttemptAt: now - 45 * MINUTE });
+    await queue.insert({ queueId: 'later', nextAttemptAt: now + 30 * MINUTE });
+
+    const startedAt = Date.now();
+    const due = await queue.findRange('nextAttemptAt', 0, now);
+    const elapsed = Date.now() - startedAt;
+
+    check('an open-ended range returns exactly the due rows', due.length === 2);
+    check('the exact bound is still applied after the bucket sweep',
+      due.every((r) => Number(r.nextAttemptAt) <= now));
+    // The assertion that matters is the clock: the answer was always correct, it just
+    // took minutes and blocked every other request while it ran.
+    check(`and answers promptly rather than scanning the range (${elapsed}ms)`, elapsed < 5000);
+
+    const capped = await queue.findRange('nextAttemptAt', 0, now, { limit: 1 });
+    check('the wire-level limit caps the result set', capped.length === 1);
+
+    // The server is still serving other calls, which is the property the stall destroyed.
+    const stillAlive = await idp.client.unary('/custom.network.DatabaseService/WhoAmI',
+      DATABASE_SCHEMAS, 'DatabaseService_WhoAmIReq', 'DatabaseService_WhoAmIRes', {});
+    check('the server is still answering other requests', stillAlive.principal === 'idp-service');
+  }
+
+  console.log('\n[13] Capability tokens may only narrow authority');
   {
     const capability = await db.issueCapability({
       collection: 'kullanicilar',
