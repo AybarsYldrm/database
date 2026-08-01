@@ -3,6 +3,7 @@
 const fs = require('node:fs');
 const fsp = fs.promises;
 const path = require('node:path');
+const crypto = require('node:crypto');
 
 const { SnowflakeGenerator } = require('./snowflake');
 const { AccessControlList, DB_PERMISSIONS } = require('./rbac');
@@ -23,6 +24,26 @@ class DatabaseManager {
     this.sessionTtlMs = sessionTtlMs;
     this.sessions = new Map(); // dbId -> { ddk, timer }
     this.openDatabases = new Map(); // dbId -> Database
+    // dbId -> Promise<Database> for an open that is currently in flight.
+    //
+    // Without this, `openDatabases.has(dbId)` is a check-then-act across an await: every
+    // request that arrives while a database is being opened misses the check and starts its
+    // own open. Each one builds a second Database, and with it a second CollectionStorage per
+    // collection -- a second append file handle, a second read-FD pool, a second in-memory
+    // index. Only the last one to finish ends up in `openDatabases`; the rest are unreachable,
+    // so closeDatabase() cannot close them and their descriptors survive until GC.
+    //
+    // Both consequences are severe. The descriptors accumulate per burst of concurrent
+    // requests, and once the process hits its file-descriptor limit every open() AND every
+    // accept() on the TLS listener fails, so the server stops answering all clients at once
+    // and only a restart clears it. Meanwhile any handle that is not the registered one tracks
+    // its own `activeSegmentOffset` over the same segment file, so writes through it record
+    // locations that do not match what is on disk and reads come back as AEAD authentication
+    // failures. Sharing one in-flight promise makes concurrent openers converge on a single
+    // handle, which is the invariant the rest of the engine already assumes.
+    this._opening = new Map();
+    this._manifestWrites = new Map(); // dbId -> tail of the serialized manifest write chain
+    this._catalogWrites = new Map();  // ownerId -> tail of the serialized catalog write chain
   }
 
   _dbDir(ownerId, dbId) { return path.join(this.baseDir, String(ownerId), String(dbId)); }
@@ -40,12 +61,38 @@ class DatabaseManager {
 
   // ---- manifest I/O ----------------------------------------------------------------------
 
+  /**
+   * Encrypts and atomically replaces a database's manifest.
+   *
+   * Serialized per database, and via a temp file whose name is unique per write. A single
+   * shared `manifest.bin.tmp` was safe only while one caller could ever be writing: with
+   * several clients defining collections and granting access on the same database, two writes
+   * interleave into that one file and the rename publishes whichever bytes happen to be there.
+   * Serializing also removes the lost-update window where a writer that serialized its
+   * snapshot first renames last and discards a newer change.
+   */
   async _writeManifest(dir, manifestKey, manifest) {
-    const plaintext = Buffer.from(JSON.stringify(manifest), 'utf8');
-    const enc = aesGcmEncrypt(manifestKey, plaintext);
-    const tmp = path.join(dir, 'manifest.bin.tmp');
-    await fsp.writeFile(tmp, enc);
-    await fsp.rename(tmp, path.join(dir, 'manifest.bin'));
+    const dbId = manifest?.dbId || dir;
+    const previous = this._manifestWrites.get(dbId) || Promise.resolve();
+    const task = previous.then(async () => {
+      const plaintext = Buffer.from(JSON.stringify(manifest), 'utf8');
+      const enc = aesGcmEncrypt(manifestKey, plaintext);
+      const tmp = path.join(dir, `manifest.bin.${crypto.randomBytes(6).toString('hex')}.tmp`);
+      try {
+        await fsp.writeFile(tmp, enc);
+        await fsp.rename(tmp, path.join(dir, 'manifest.bin'));
+      } catch (err) {
+        await fsp.unlink(tmp).catch(() => {});
+        throw err;
+      }
+    });
+    const tail = task.then(() => undefined, () => undefined);
+    this._manifestWrites.set(dbId, tail);
+    try {
+      await task;
+    } finally {
+      if (this._manifestWrites.get(dbId) === tail) this._manifestWrites.delete(dbId);
+    }
   }
 
   async _readManifest(dir, manifestKey) {
@@ -54,13 +101,34 @@ class DatabaseManager {
     return JSON.parse(plaintext.toString('utf8'));
   }
 
+  // Read-modify-write, so it is serialized per owner: two clients creating a database at the
+  // same time would otherwise both read the same list and the second write would drop the
+  // first one's entry. Written through a temp file for the same reason as the manifest.
   async _appendCatalog(ownerId, entry) {
-    const p = this._catalogPath(ownerId);
-    let list = [];
-    try { list = JSON.parse(await fsp.readFile(p, 'utf8')); } catch (_) {}
-    list.push(entry);
-    await fsp.mkdir(path.dirname(p), { recursive: true });
-    await fsp.writeFile(p, JSON.stringify(list));
+    const previous = this._catalogWrites.get(String(ownerId)) || Promise.resolve();
+    const task = previous.then(async () => {
+      const p = this._catalogPath(ownerId);
+      let list = [];
+      try { list = JSON.parse(await fsp.readFile(p, 'utf8')); } catch (_) {}
+      if (!Array.isArray(list)) list = [];
+      list.push(entry);
+      await fsp.mkdir(path.dirname(p), { recursive: true });
+      const tmp = `${p}.${crypto.randomBytes(6).toString('hex')}.tmp`;
+      try {
+        await fsp.writeFile(tmp, JSON.stringify(list));
+        await fsp.rename(tmp, p);
+      } catch (err) {
+        await fsp.unlink(tmp).catch(() => {});
+        throw err;
+      }
+    });
+    const tail = task.then(() => undefined, () => undefined);
+    this._catalogWrites.set(String(ownerId), tail);
+    try {
+      await task;
+    } finally {
+      if (this._catalogWrites.get(String(ownerId)) === tail) this._catalogWrites.delete(String(ownerId));
+    }
   }
 
   // Non-authoritative convenience listing (dbId/name/createdAt only — no schema, no ACL, no
@@ -110,12 +178,29 @@ class DatabaseManager {
   }
 
   async openDatabase({ ownerId, dbId, requesterId, keyProvider, requiredPermission = DB_PERMISSIONS.READ }) {
-    if (this.openDatabases.has(dbId)) {
-      const db = this.openDatabases.get(dbId);
-      if (!db.acl.can(requesterId, requiredPermission)) throw new Error('fitdb: access denied');
-      return db;
+    const open = this.openDatabases.get(dbId);
+    if (open) return this._attachToOpen(open, { dbId, requesterId, keyProvider, requiredPermission });
+
+    // A second caller arriving mid-open waits for the first one's handle rather than building
+    // a rival one, then goes through exactly the same key and ACL checks against it.
+    const inFlight = this._opening.get(dbId);
+    if (inFlight) {
+      const db = await inFlight;
+      return this._attachToOpen(db, { dbId, requesterId, keyProvider, requiredPermission });
     }
 
+    const attempt = this._openUnshared({ ownerId, dbId, requesterId, keyProvider, requiredPermission });
+    // Registered before the first await so a caller that arrives on the very next tick sees it.
+    this._opening.set(dbId, attempt);
+    try {
+      return await attempt;
+    } finally {
+      // A failed open must not leave a rejected promise behind for the next caller to await.
+      if (this._opening.get(dbId) === attempt) this._opening.delete(dbId);
+    }
+  }
+
+  async _openUnshared({ ownerId, dbId, requesterId, keyProvider, requiredPermission }) {
     const dir = this._dbDir(ownerId, dbId);
     const dbIdBuf = Buffer.from(dbId);
     const kek = await keyProvider.deriveKek(dbIdBuf);
@@ -130,8 +215,40 @@ class DatabaseManager {
 
     const persistManifest = (m) => this._writeManifest(dir, manifestKey, m);
     const db = new Database({ dbId, name: manifest.name, dir, ddk, acl, manifest, idGenerator: this._idGen(), persistManifest });
-    await db._openExistingCollections();
+    try {
+      await db._openExistingCollections();
+    } catch (err) {
+      // Whatever did open before the failure still holds descriptors; this handle is being
+      // thrown away, so they have to go back now rather than at the next garbage collection.
+      await db.close().catch(() => {});
+      throw err;
+    }
     this.openDatabases.set(dbId, db);
+    return db;
+  }
+
+  /**
+   * Admits a caller to an already-open database.
+   *
+   * The key material is re-checked even though the handle exists. Skipping it -- which is what
+   * this used to do -- meant that once ANY session had a database open, any other principal on
+   * its ACL could attach to it with a `clientSecret` of the right length and no other
+   * relationship to the real one, because nothing after the initial open ever consulted the
+   * secret again. The check is one HKDF plus one 32-byte AES-GCM open, so it costs nothing
+   * worth trading a credential check for.
+   */
+  async _attachToOpen(db, { dbId, requesterId, keyProvider, requiredPermission }) {
+    const kek = await keyProvider.deriveKek(Buffer.from(dbId));
+    let unwrapped;
+    try { unwrapped = unwrapKey(kek, Buffer.from(db.manifest.wrappedDDK, 'base64')); }
+    catch (_) { unwrapped = null; }
+    // Same failure surface as a wrong secret on a cold open: the manifest cannot be
+    // authenticated. server.js maps that onto UNAUTHENTICATED.
+    if (!unwrapped || unwrapped.length !== db.ddk.length || !crypto.timingSafeEqual(unwrapped, db.ddk)) {
+      throw new Error('fitdb: unsupported state or unable to authenticate data');
+    }
+    if (!db.acl.can(requesterId, requiredPermission)) throw new Error('fitdb: access denied');
+    this._cacheSession(dbId, db.ddk);
     return db;
   }
 
@@ -144,6 +261,12 @@ class DatabaseManager {
   }
 
   async closeDatabase(dbId) {
+    // An open that is still in flight would otherwise register its handle just after this
+    // method finished, leaving a database that is closed as far as callers are concerned but
+    // still holding every descriptor it opened.
+    const inFlight = this._opening.get(dbId);
+    if (inFlight) await inFlight.catch(() => {});
+
     const db = this.openDatabases.get(dbId);
     if (!db) return false;
     await db.close();

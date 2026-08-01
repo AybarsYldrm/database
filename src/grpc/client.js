@@ -177,6 +177,11 @@ class WatchedCollection extends EventEmitter {
     this._cancel = null;
     this._backoff = collection.database.options.reconnectWatchMs;
     this._ready = null;
+    // A snapshot arrives as one or more chunks (the server bounds each message so a large
+    // collection cannot exceed the transport's per-message limit). Records accumulate here
+    // and are applied as one atomic load when the final chunk lands, so the view is never
+    // briefly a partial copy that a reader could observe.
+    this._pendingSnapshot = null;
   }
 
   /** True once a snapshot has landed and no gap has been detected since. */
@@ -204,6 +209,9 @@ class WatchedCollection extends EventEmitter {
 
   _connect() {
     if (!this.running) return;
+    // A stream that died part way through a chunked snapshot must not leave those records
+    // to be concatenated onto the next one.
+    this._pendingSnapshot = null;
     const { database, name } = { database: this.collection.database, name: this.collection.name };
 
     const call = database.client.serverStream(
@@ -236,13 +244,19 @@ class WatchedCollection extends EventEmitter {
     catch (err) { return this.emit('error', err); }
 
     switch (payload.type) {
-      case WATCH_EVENTS.SNAPSHOT:
-        this.view.loadSnapshot(payload.records, payload.lastCollSeq);
+      case WATCH_EVENTS.SNAPSHOT: {
+        if (!this._pendingSnapshot) this._pendingSnapshot = [];
+        for (const record of payload.records || []) this._pendingSnapshot.push(record);
+        if (payload.more) return; // more chunks coming; the view stays on its previous contents
+        const records = this._pendingSnapshot;
+        this._pendingSnapshot = null;
+        this.view.loadSnapshot(records, payload.lastCollSeq);
         this.lastSeq = payload.lastSeq;
         this._backoff = this.collection.database.options.reconnectWatchMs;
         this.emit('snapshot', { size: this.view.size });
         this.emit('ready', this);
         break;
+      }
 
       case WATCH_EVENTS.CHANGE: {
         this.lastSeq = payload.seq;
@@ -262,6 +276,8 @@ class WatchedCollection extends EventEmitter {
       }
 
       case WATCH_EVENTS.RESET:
+        // The server is about to re-send a snapshot; anything half-collected is superseded.
+        this._pendingSnapshot = null;
         this.emit('stale', { reason: payload.reason });
         this.view.stale = true;
         break;
