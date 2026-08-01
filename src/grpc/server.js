@@ -37,6 +37,7 @@ const DEFAULT_OPTIONS = {
   maxFindLimit: 5000,
   watchPingMs: 25000,
   watchBacklogLimit: 512,
+  watchSnapshotChunkSize: 500,  // records per snapshot message; keeps it under the wire limit
   strictFields: false,          // reject unknown fields on write instead of dropping them
   autoGrantOwner: true,         // creating a database grants the creating principal ADMIN
   capabilityMaxTtlMs: 120000,
@@ -136,7 +137,7 @@ class DatabaseServer extends EventEmitter {
       database = await this._open({ dbId, ownerId: remembered.ownerId, clientSecret: remembered.secret, principal });
     }
 
-    if (database.acl.maskFor(principal.id) === 0) {
+    if (database.acl.effectiveMaskFor(principal.id) === 0) {
       // No ACL entry at all: the certificate is valid and the principal is authorised to talk
       // to this server, but has been granted nothing on this particular database. Reporting
       // NOT_FOUND rather than PERMISSION_DENIED would be friendlier to enumeration, but the
@@ -176,6 +177,21 @@ class DatabaseServer extends EventEmitter {
       if (/ENOENT/.test(err.message)) throw new GrpcError(GRPC_STATUS.NOT_FOUND, `no database '${dbId}' for that owner`);
       throw err;
     }
+  }
+
+  /**
+   * Writes an ACL change through to the manifest.
+   *
+   * The in-memory manifest is updated first, and that is the whole point. This used to persist
+   * `{ ...database.manifest, acl: database.acl.toJSON() }` -- a throwaway copy -- so the
+   * database's own `manifest.acl` still held the pre-grant table. The next thing to persist the
+   * manifest for any other reason (defining a collection, a migration) wrote that stale copy
+   * back out, silently undoing the grant on disk while it kept working in memory until the next
+   * restart. Sharing a database with a second service is exactly the operation that trips it.
+   */
+  async _persistAcl(database) {
+    database.manifest.acl = database.acl.toJSON();
+    await database._persistManifest(database.manifest);
   }
 
   _collection(database, name) {
@@ -294,7 +310,6 @@ class DatabaseServer extends EventEmitter {
           }
 
           const dropFields = req.dropFields || [];
-          const existed = !!database.manifest.collections?.[req.collection];
 
           if (req.dryRun) {
             const plan = database.inspectMigration(req.collection, fields, { dropFields, allowRetype: !!req.allowRetype });
@@ -311,9 +326,12 @@ class DatabaseServer extends EventEmitter {
             };
           }
 
-          let collection;
+          // applyCollectionSchema rather than defineCollectionAsync: it reports what THIS call
+          // did. `collection.migration` describes whichever definition ran most recently, so
+          // two clients applying the same migration at once could both claim it as theirs.
+          let migration;
           try {
-            collection = await database.defineCollectionAsync(req.collection, {
+            ({ migration } = await database.applyCollectionSchema(req.collection, {
               fields,
               title: req.title || null,
               description: req.description || null,
@@ -321,29 +339,29 @@ class DatabaseServer extends EventEmitter {
               dropFields,
               allowRetype: !!req.allowRetype,
               ...(req.segmentMaxBytes ? { segmentMaxBytes: Number(req.segmentMaxBytes) } : {}),
-            });
+            }));
           } catch (err) {
             // Both a malformed schema and a refused migration are "your schema is wrong",
             // not a server fault -- and the migration errors carry the remedy in their text.
             throw new GrpcError(GRPC_STATUS.INVALID_ARGUMENT, err.message);
           }
 
-          const migration = collection.migration || { changed: false, changes: [], rebuilt: false };
+          const created = !!migration.created;
           if (migration.changed) {
             self.emit('collectionMigrated', {
               dbId: req.dbId, collection: req.collection, by: principal.id, changes: migration.changes,
             });
             self._log?.info?.(`[db] '${principal.id}' migrated ${req.collection}: `
               + migration.changes.map((c) => `${c.kind}(${c.field})`).join(', '));
-          } else if (!existed) {
+          } else if (created) {
             self.emit('collectionDefined', { dbId: req.dbId, collection: req.collection, by: principal.id });
           }
 
           return {
-            message: !existed ? `collection '${req.collection}' defined`
+            message: created ? `collection '${req.collection}' defined`
               : migration.changed ? `collection '${req.collection}' migrated`
                 : `collection '${req.collection}' is already up to date`,
-            created: !existed,
+            created,
             migrated: !!migration.changed,
             changesJson: toJson(migration.changes || []),
             indexesRebuilt: !!migration.rebuilt,
@@ -547,7 +565,7 @@ class DatabaseServer extends EventEmitter {
           const { database, principal } = await self._database(call, req.dbId);
           requirePermission(database, principal, DB_PERMISSIONS.ISSUE_CAPABILITY, 'issue capability tokens');
 
-          const ownMask = database.acl.maskFor(principal.id);
+          const ownMask = database.acl.effectiveMaskFor(principal.id);
           const scope = Number(req.scope || 0);
           if (!scope) throw new GrpcError(GRPC_STATUS.INVALID_ARGUMENT, 'scope must be a non-zero DB_PERMISSIONS bitmask');
           // A capability may only ever narrow authority. Without this, ISSUE_CAPABILITY would
@@ -582,13 +600,15 @@ class DatabaseServer extends EventEmitter {
         handler: async (req, call) => {
           const { database, principal } = await self._database(call, req.dbId);
           requirePermission(database, principal, DB_PERMISSIONS.SHARE, 'share the database');
-          const ownMask = database.acl.maskFor(principal.id);
+          if (!req.principal) throw new GrpcError(GRPC_STATUS.INVALID_ARGUMENT, 'principal is required');
+          const ownMask = database.acl.effectiveMaskFor(principal.id);
           const mask = Number(req.mask || 0);
+          if (!mask) throw new GrpcError(GRPC_STATUS.INVALID_ARGUMENT, 'mask must be a non-zero DB_PERMISSIONS bitmask');
           if ((ownMask & mask) !== mask) {
             throw new GrpcError(GRPC_STATUS.PERMISSION_DENIED, 'cannot grant permissions you do not hold');
           }
           database.acl.grant(req.principal, mask);
-          await database._persistManifest({ ...database.manifest, acl: database.acl.toJSON() });
+          await self._persistAcl(database);
           self.emit('accessGranted', { dbId: req.dbId, principal: req.principal, mask, by: principal.id });
           return { mask: database.acl.maskFor(req.principal) };
         },
@@ -599,8 +619,9 @@ class DatabaseServer extends EventEmitter {
         handler: async (req, call) => {
           const { database, principal } = await self._database(call, req.dbId);
           requirePermission(database, principal, DB_PERMISSIONS.SHARE, 'share the database');
+          if (!req.principal) throw new GrpcError(GRPC_STATUS.INVALID_ARGUMENT, 'principal is required');
           database.acl.revoke(req.principal, Number(req.mask || 0));
-          await database._persistManifest({ ...database.manifest, acl: database.acl.toJSON() });
+          await self._persistAcl(database);
           self.emit('accessRevoked', { dbId: req.dbId, principal: req.principal, by: principal.id });
           return { mask: database.acl.maskFor(req.principal) };
         },
@@ -646,7 +667,40 @@ class DatabaseServer extends EventEmitter {
     let streaming = false;
     let dropped = false;
 
-    const send = (payload) => { if (call.isActive()) call.write({ payloadJson: toJson(payload) }); };
+    const send = (payload) => { if (call.isActive()) return call.write({ payloadJson: toJson(payload) }); return false; };
+
+    /**
+     * Ships a snapshot as a sequence of bounded chunks rather than one message.
+     *
+     * A whole collection in a single message is fine right up to the transport's 4 MiB
+     * per-message ceiling, past which the write fails with RESOURCE_EXHAUSTED, the stream
+     * dies, and the client's watcher reconnects and asks for the same snapshot again -- a
+     * loop that re-decrypts every record in the collection on every pass and never makes
+     * progress. Chunking removes the ceiling entirely and lets the server yield between
+     * batches so a large snapshot does not monopolise the process while other clients wait.
+     *
+     * `more: true` marks a continuation; the client accumulates until the chunk that omits it.
+     */
+    const sendSnapshot = async (snapshot) => {
+      const size = Math.max(1, Number(this.options.watchSnapshotChunkSize) || 500);
+      const total = snapshot.records.length;
+      for (let offset = 0; offset < total || offset === 0; offset += size) {
+        if (!call.isActive()) return;
+        const slice = snapshot.records.slice(offset, offset + size);
+        const accepted = send({
+          type: WATCH_EVENTS.SNAPSHOT,
+          records: slice.map((r) => recordToJsonObject(collection.schema, r)),
+          lastSeq: snapshot.lastSeq,
+          lastCollSeq: snapshot.lastCollSeq,
+          more: offset + size < total,
+        });
+        // `false` means the socket's send buffer is full. There is no drain signal on this
+        // call object, so this is a soft yield rather than true backpressure: it hands the
+        // event loop back to everyone else instead of racing ahead and growing the buffer.
+        await new Promise((resolve) => setTimeout(resolve, accepted === false ? 5 : 0));
+        if (total === 0) return;
+      }
+    };
 
     const emit = (event) => {
       if (event.collection !== req.collection) return;
@@ -670,27 +724,26 @@ class DatabaseServer extends EventEmitter {
     };
 
     const unsubscribe = database.watch(req.collection, emit);
+    let ping = null;
 
     try {
       if (req.resumeSeq && Number(req.resumeSeq) > 0) {
         const replay = database.changes.replay(Number(req.resumeSeq), req.collection);
         if (replay.resumeLost) {
           send({ type: WATCH_EVENTS.RESET, reason: 'resume point is no longer in the change backlog' });
-          const snapshot = await database.snapshot(req.collection);
-          send(snapshotPayload(collection, snapshot));
+          await sendSnapshot(await database.snapshot(req.collection));
         } else {
           for (const event of replay.events) emit(event);
         }
       } else if (req.includeSnapshot !== false) {
-        const snapshot = await database.snapshot(req.collection);
-        send(snapshotPayload(collection, snapshot));
+        await sendSnapshot(await database.snapshot(req.collection));
       }
 
       if (dropped) {
         send({ type: WATCH_EVENTS.RESET, reason: 'change backlog overflowed while the snapshot was being produced' });
         buffered = [];
-        const snapshot = await database.snapshot(req.collection);
-        send(snapshotPayload(collection, snapshot));
+        dropped = false;
+        await sendSnapshot(await database.snapshot(req.collection));
       }
 
       // Anything that landed during the snapshot and is not already covered by it.
@@ -700,15 +753,22 @@ class DatabaseServer extends EventEmitter {
 
       // Idle streams get reaped by load balancers and NAT tables. A periodic ping keeps the
       // path open; the client discards these rather than treating them as changes.
-      const ping = setInterval(() => send({ type: WATCH_EVENTS.PING, at: Date.now() }), this.options.watchPingMs);
+      ping = setInterval(() => send({ type: WATCH_EVENTS.PING, at: Date.now() }), this.options.watchPingMs);
       ping.unref?.();
 
       await new Promise((resolve) => {
-        call.on('cancelled', resolve);
-        call.on('error', resolve);
+        // The stream may already be gone. Building a snapshot is not instantaneous, and a
+        // client that disconnects while one is in progress has its 'cancelled' event emitted
+        // before this listener exists -- waiting on an event that has already fired stranded
+        // the handler permanently, and with it the change-stream subscription and this timer.
+        // A watcher client reconnects on its own with backoff, so a flapping connection used
+        // to leak one subscription and one interval per attempt, for the life of the process.
+        if (!call.isActive()) return resolve();
+        call.once('cancelled', resolve);
+        call.once('error', resolve);
       });
-      clearInterval(ping);
     } finally {
+      if (ping) clearInterval(ping);
       unsubscribe();
     }
   }
@@ -758,15 +818,6 @@ class DatabaseServer extends EventEmitter {
     for (const dbId of [...this.manager.openDatabases.keys()]) await this.manager.closeDatabase(dbId);
     this._secrets.clear();
   }
-}
-
-function snapshotPayload(collection, snapshot) {
-  return {
-    type: WATCH_EVENTS.SNAPSHOT,
-    records: snapshot.records.map((r) => recordToJsonObject(collection.schema, r)),
-    lastSeq: snapshot.lastSeq,
-    lastCollSeq: snapshot.lastCollSeq,
-  };
 }
 
 function clamp(value, min, max) { return Math.min(max, Math.max(min, Number(value) || min)); }

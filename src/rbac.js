@@ -31,6 +31,18 @@ const DB_PERMISSIONS = defineBitmask([
 
 const OWNER_DEFAULT_MASK = combine(...Object.values(DB_PERMISSIONS));
 
+// ADMIN is documented above as "full control, implies all of the above", and identity.js's
+// requirePermission() has always honoured that. AccessControlList.can() did not: it ran a
+// plain subset test, so a principal granted exactly ADMIN failed `can(id, READ)` -- 128 & 1
+// is 0 -- and DatabaseManager.openDatabase, which gates on can(), refused it outright. The
+// two authorisation checks in the same request path therefore disagreed, and the practical
+// effect was that GrantAccess(principal, ADMIN) produced a principal that could not open the
+// database it had just been made an administrator of. Expanding the bit here, in the one
+// place that owns the meaning of the mask, keeps every caller consistent.
+function expandMask(mask) {
+  return has(mask, DB_PERMISSIONS.ADMIN) ? OWNER_DEFAULT_MASK : mask;
+}
+
 class AccessControlList {
   constructor(ownerId, ownerMask = OWNER_DEFAULT_MASK) {
     this.entries = new Map();
@@ -45,12 +57,20 @@ class AccessControlList {
   revoke(userId, mask) {
     const key = String(userId);
     const cur = this.entries.get(key) || 0;
-    const next = cur & ~mask;
+    // Revoking ADMIN has to strip what ADMIN implied, not just clear the bit -- otherwise
+    // `revoke(id, ADMIN)` on an entry that only ever held ADMIN leaves 0 (correct), while
+    // revoking it from an entry that also holds explicit bits silently keeps full control.
+    const next = expandMask(cur) & ~expandMask(mask);
     if (next === 0) this.entries.delete(key); else this.entries.set(key, next);
   }
 
+  /** The grant exactly as stored -- what GrantAccess/RevokeAccess report back. */
   maskFor(userId) { return this.entries.get(String(userId)) || 0; }
-  can(userId, required) { return has(this.maskFor(userId), required); }
+
+  /** The grant with ADMIN expanded -- what every authorisation decision must be made on. */
+  effectiveMaskFor(userId) { return expandMask(this.maskFor(userId)); }
+
+  can(userId, required) { return has(this.effectiveMaskFor(userId), required); }
 
   toJSON() { return Object.fromEntries(this.entries); }
 
@@ -61,4 +81,7 @@ class AccessControlList {
   }
 }
 
-module.exports = { defineBitmask, combine, has, hasAny, AccessControlList, DB_PERMISSIONS, OWNER_DEFAULT_MASK };
+module.exports = {
+  defineBitmask, combine, has, hasAny, expandMask,
+  AccessControlList, DB_PERMISSIONS, OWNER_DEFAULT_MASK,
+};

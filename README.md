@@ -326,6 +326,12 @@ record forever. Reading first can only cause the harmless opposite: a re-applied
 Reconnection uses full jitter. A fixed retry interval turns a server restart into a
 synchronised stampede from every watcher at once.
 
+The opening snapshot is **chunked** (`watchSnapshotChunkSize`, 500 records per message) and the
+client applies it as one atomic load when the last chunk lands, so a view is never briefly a
+partial copy. One message per snapshot worked only up to the transport's 4 MiB ceiling, past
+which the write failed, the stream died, and the watcher reconnected and asked for the same
+snapshot again — a loop that re-decrypted the whole collection on every pass and never finished.
+
 ---
 
 ## 4. Secrets: certificates and keys
@@ -434,6 +440,48 @@ Capability tokens still work for the direct-access path and may only ever **narr
 a token wider than the issuer's own grant is refused, so `ISSUE_CAPABILITY` is a delegation
 primitive rather than an escalation one.
 
+**`ADMIN` implies every other permission**, in both places authorisation is decided: the ACL's
+own `can()` and `requirePermission()`. `maskFor()` reports the grant exactly as stored, which is
+what `GrantAccess`/`RevokeAccess` return; `effectiveMaskFor()` reports it with `ADMIN` expanded,
+which is what every gate uses.
+
+```js
+await db.grantAccess('smtp-service', DB_PERMISSIONS.ADMIN);
+// smtp-service can now open, read, write and migrate this database.
+```
+
+---
+
+## 6a. Several clients on one server
+
+One server process, several services, all of them connected and writing at once, is the normal
+deployment — see `examples/db-server.js` for a complete one and `npm run test:multi-client` for
+the properties it relies on.
+
+Everything below is enforced by the engine, not by convention:
+
+- **Concurrent opens converge on one handle.** Requests arriving while a database is still
+  opening share that open instead of each starting their own. Two handles over one directory
+  each track their own segment offsets, so writes through the loser record locations that do not
+  match the file and reads come back as AEAD authentication failures — and the orphaned handles
+  hold file descriptors that no `close()` can reach, so a busy server eventually hits its
+  descriptor limit and stops answering *every* client at once.
+- **Key material is re-checked on every open**, including when the database is already open for
+  someone else. Being on the ACL is not enough to attach without the `clientSecret`.
+- **Schema changes are serialized per collection.** Two clients applying the same migration
+  simultaneously cannot overlap an index rebuild, and each is told what its own call did rather
+  than what the other one's did.
+- **ACL grants and manifest writes are serialized per database** and published by atomic rename,
+  so a grant cannot be lost to a concurrent schema change.
+- **Writes to a collection are already serialized** by the storage engine's write queue, and
+  `insertUnique` performs its check and its append inside one queued step — the check-then-insert
+  spelling of that does not hold when two clients race for the same key.
+- **Ids stay unique across a backwards clock step.** These are primary keys, and a repeated one
+  overwrites rather than fails.
+
+The per-database ACL is what keeps services apart: a principal that is `admin` at the server
+level still reaches only the databases its own ACL entry names.
+
 ---
 
 ## 7. Key hierarchy
@@ -511,6 +559,12 @@ smaller correctness surface than leveled compaction, at the cost of O(total) flu
 
 ## 10. Known limitations
 
+- One writer process per data directory. Every serialization guarantee above is in-process;
+  two server processes over the same `baseDir` would each keep their own segment offsets and
+  corrupt each other, exactly as two handles inside one process used to.
+- A `WatchCollection` snapshot is chunked so an arbitrarily large collection can be streamed,
+  but the server does not observe HTTP/2 drain on that stream — a watcher that stops reading
+  entirely has its backlog buffered by Node rather than throttled at the source.
 - `SecondaryIndexStore` keeps one on-disk segment; a flush costs O(total field entries).
   Leveled compaction is the natural next step if that ever measures.
 - `SCAN` sorts the full remaining candidate set per page; a collection that outgrows this

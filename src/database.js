@@ -204,6 +204,10 @@ class Database {
     // manifest on disk is otherwise a point-in-time snapshot from creation time only).
     this._persistManifest = persistManifest || (async () => {});
     this.collections = new Map();
+    // collectionName -> tail of the in-flight define/migrate chain. Two clients defining or
+    // evolving the same collection at once would otherwise overlap a schema application with
+    // an index rebuild over the same files.
+    this._defining = new Map();
   }
 
   // Adapts the storage engine's numeric op code into the hub's stable string vocabulary, so
@@ -230,7 +234,15 @@ class Database {
         compress: def.options?.compress,
         onChange: this._changeSink(name),
       });
-      await storage.open();
+      try {
+        await storage.open();
+      } catch (err) {
+        // open() may have taken file handles before it failed, and this storage is about to
+        // become unreachable -- nothing else holds a reference to it, so releasing them here
+        // is the only chance before the garbage collector gets around to it.
+        await storage.close().catch(() => {});
+        throw err;
+      }
       this.collections.set(name, new Collection(name, storage.schema, storage, { idGenerator: this._idGenerator, title: def.title, description: def.description }));
     }
   }
@@ -290,7 +302,12 @@ class Database {
     const ready = storage.open().then(() => this._persistManifest(this.manifest));
     const collection = new Collection(name, schema, storage, { idGenerator: this._idGenerator, title, description });
     collection._readyPromise = ready;
-    collection.migration = { changed: false, changes: [], rebuilt: false };
+    // `created` distinguishes this from "the collection already existed and needed no change",
+    // which is otherwise the identical result. A caller that computes it by checking the
+    // manifest before the call gets it wrong under concurrency: with two clients defining the
+    // same collection at once, both look before either has written, and both claim to have
+    // created it.
+    collection.migration = { changed: false, changes: [], rebuilt: false, created: true };
     this.collections.set(name, collection);
     return collection;
   }
@@ -311,7 +328,7 @@ class Database {
     if (!plan.applicable) throw new SchemaMigrationError(describeBlockers(name, plan), plan.blocked);
 
     if (!plan.changed) {
-      collection.migration = { changed: false, changes: [], rebuilt: false };
+      collection.migration = { changed: false, changes: [], rebuilt: false, created: false };
       return collection;
     }
 
@@ -338,15 +355,52 @@ class Database {
       changed: true,
       changes: plan.changes,
       rebuilt: plan.needsRebuild,
+      created: false,
       schemaVersion: definition.schemaVersion,
       reserved: plan.newReserved,
     };
     return collection;
   }
 
+  /**
+   * defineCollection() plus the wait for its storage to be open and its manifest persisted,
+   * returning what this particular call did: `{ collection, migration }`.
+   *
+   * Two properties this has and reading `collection.migration` after the fact does not.
+   *
+   * It is serialized per collection name. defineCollection() itself is synchronous up to the
+   * point it registers the collection, so two callers can never both create one -- but the
+   * second lands in _migrateCollection(), which calls applySchema() on a storage whose open()
+   * may still be replaying, and an index rebuild overlapping a replay over the same files is
+   * not something either side is written to survive.
+   *
+   * And the migration result is captured inside that critical section. `collection` is a single
+   * shared object per collection, so its `.migration` describes whichever definition ran most
+   * recently -- with two clients applying the same migration at once, both could end up
+   * reporting the same one as theirs. Each call assigns a fresh object rather than mutating the
+   * old one, so a reference taken here stays true to the call that took it.
+   */
+  async applyCollectionSchema(name, opts) {
+    const previous = this._defining.get(name) || Promise.resolve();
+    const task = previous.then(async () => {
+      const collection = this.defineCollection(name, opts);
+      await collection._readyPromise;
+      return { collection, migration: collection.migration || { changed: false, changes: [], rebuilt: false, created: false } };
+    });
+    // The chain must keep flowing even when one definition is rejected (a refused migration is
+    // an ordinary outcome), so the tail settles regardless while the caller still sees the
+    // real result of their own call.
+    const tail = task.then(() => undefined, () => undefined);
+    this._defining.set(name, tail);
+    try {
+      return await task;
+    } finally {
+      if (this._defining.get(name) === tail) this._defining.delete(name);
+    }
+  }
+
   async defineCollectionAsync(name, opts) {
-    const collection = this.defineCollection(name, opts);
-    await collection._readyPromise;
+    const { collection } = await this.applyCollectionSchema(name, opts);
     return collection;
   }
 
@@ -390,12 +444,12 @@ class Database {
     const applied = {};
     for (const [name, definition] of Object.entries(registry)) {
       if (dryRun) { applied[name] = this.inspectMigration(name, definition.fields); continue; }
-      const collection = await this.defineCollectionAsync(name, {
+      const { migration } = await this.applyCollectionSchema(name, {
         ...definition,
         dropFields: dropFields[name] || [],
         allowRetype,
       });
-      applied[name] = collection.migration;
+      applied[name] = migration;
     }
     return applied;
   }

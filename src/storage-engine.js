@@ -84,7 +84,10 @@ class CollectionStorage {
     this._blindKeys = new Map(); // fieldName -> derived blind key (cached)
     this._rangeKeys = new Map(); // fieldName -> derived range-bucket blind key (cached, distinct from _blindKeys)
 
-    this.readFds = new Map();    // segmentId -> FileHandle (read-only), bounded + LRU-evicted
+    // segmentId -> { fd, segId, inUse, retired }; bounded and LRU-evicted, but never evicting
+    // a handle a concurrent read is still positioned on -- see _acquireReadFd.
+    this.readFds = new Map();
+    this._readFdOpens = new Map(); // segmentId -> Promise<entry> for an open in flight
     this.activeSegmentId = 0;
     this.activeSegmentOffset = 0;
     this.activeWriteFd = null;
@@ -96,6 +99,16 @@ class CollectionStorage {
   // ---- lifecycle -----------------------------------------------------------------------
 
   async open() {
+    // Opening twice would silently orphan the first activeWriteFd and every read handle taken
+    // during replay, and leave two in-memory indexes disagreeing about the same file. Callers
+    // that legitimately race (two requests for the same collection) share the first open.
+    if (this._opened) return this;
+    if (this._openPromise) return this._openPromise;
+    this._openPromise = this._openOnce().finally(() => { this._openPromise = null; });
+    return this._openPromise;
+  }
+
+  async _openOnce() {
     await fsp.mkdir(this.dir, { recursive: true });
 
     // Disk-backed fields (diskBacked:true) get their own independent, persistent
@@ -159,14 +172,28 @@ class CollectionStorage {
     return this;
   }
 
+  /**
+   * Releases every descriptor this storage holds, whether or not open() ran to completion.
+   *
+   * The `if (!this._opened) return` this used to start with meant a storage whose open()
+   * failed part way -- disk-backed index stores created, segment handles taken, then a throw --
+   * could not be cleaned up at all: its close() was a no-op and its file handles survived
+   * until garbage collection. Snapshotting is the part that needs a complete open; freeing
+   * handles is not, and must happen either way.
+   */
   async close() {
-    if (!this._opened) return;
-    await this._writeSnapshot();
-    for (const store of this.diskStores.values()) await store.close(); // flushes pending memtable/tombstones
-    if (this.activeWriteFd) await this.activeWriteFd.close();
-    for (const fd of this.readFds.values()) await fd.close().catch(() => {});
-    this.readFds.clear();
+    const wasOpen = this._opened;
     this._opened = false;
+    if (wasOpen) await this._writeSnapshot();
+    for (const store of this.diskStores.values()) await store.close().catch(() => {}); // flushes pending memtable/tombstones
+    if (this.activeWriteFd) {
+      const fd = this.activeWriteFd;
+      this.activeWriteFd = null;
+      await fd.close().catch(() => {});
+    }
+    for (const entry of [...this.readFds.values()]) this._retireReadFd(entry);
+    this.readFds.clear();
+    this._readFdOpens.clear();
   }
 
   // ---- crypto/compress helpers -----------------------------------------------------------
@@ -218,26 +245,86 @@ class CollectionStorage {
 
   // ---- segment file plumbing (bounded read-FD pool, LRU-evicted) -------------------------
 
-  async _getReadFd(segId) {
-    if (this.readFds.has(segId)) {
-      const fd = this.readFds.get(segId);
-      this.readFds.delete(segId); this.readFds.set(segId, fd); // refresh recency
-      return fd;
+  /**
+   * Borrows a read handle for a segment. Every caller must pair this with _release().
+   *
+   * Two things here exist only because reads run concurrently -- several requests reading the
+   * same collection at once is the normal case for a server, not an edge case.
+   *
+   * The in-flight map: `readFds.has(segId)` followed by `await fsp.open(...)` is a
+   * check-then-act, so two readers that both miss on the same segment both open it and the
+   * second `set` drops the first handle on the floor, unclosed, for as long as it takes the
+   * garbage collector to notice. Sharing the pending open makes the miss happen once.
+   *
+   * The use count: eviction (and compaction) used to close whichever handle was least
+   * recently used, including one another reader was in the middle of a positional read on,
+   * which surfaces as a spurious EBADF. A handle that is still in use is unlinked from the
+   * pool and closed by whoever releases it last instead.
+   */
+  async _acquireReadFd(segId) {
+    for (;;) {
+      const existing = this.readFds.get(segId);
+      if (existing) {
+        this.readFds.delete(segId); this.readFds.set(segId, existing); // refresh recency
+        existing.inUse++; // synchronous with the lookup, so eviction cannot slip in between
+        return existing;
+      }
+
+      const pending = this._readFdOpens.get(segId);
+      if (pending) {
+        const entry = await pending;
+        entry.inUse++;
+        // Retired between this open finishing and this caller counting itself in. The handle
+        // may already be closed, so take a fresh one rather than read through it.
+        if (entry.retired) { this._release(entry); continue; }
+        return entry;
+      }
+
+      const opening = (async () => {
+        const fd = await fsp.open(path.join(this.dir, segFileName(segId)), 'r');
+        // Starts at 1, held by the caller that initiated this open. An entry sitting at 0
+        // between being published and being counted could be evicted -- and closed -- by
+        // another segment's first read before its own opener ever touched it.
+        const entry = { fd, segId, inUse: 1, retired: false };
+        this._evictReadFds();
+        this.readFds.set(segId, entry);
+        return entry;
+      })();
+
+      this._readFdOpens.set(segId, opening);
+      try {
+        return await opening; // the reservation above belongs to this caller
+      } finally {
+        if (this._readFdOpens.get(segId) === opening) this._readFdOpens.delete(segId);
+      }
     }
-    if (this.readFds.size >= this.maxOpenReadFds) {
-      const oldestSegId = this.readFds.keys().next().value;
-      const oldestFd = this.readFds.get(oldestSegId);
-      this.readFds.delete(oldestSegId);
-      await oldestFd.close().catch(() => {});
+  }
+
+  _release(entry) {
+    if (!entry) return;
+    entry.inUse--;
+    // Retired while this reader held it: the pool has already forgotten it, so the last
+    // release is the only remaining chance to give the descriptor back.
+    if (entry.retired && entry.inUse <= 0) entry.fd.close().catch(() => {});
+  }
+
+  _retireReadFd(entry) {
+    if (!entry || entry.retired) return;
+    entry.retired = true;
+    this.readFds.delete(entry.segId);
+    if (entry.inUse <= 0) entry.fd.close().catch(() => {});
+  }
+
+  _evictReadFds() {
+    while (this.readFds.size >= this.maxOpenReadFds) {
+      const oldest = this.readFds.values().next().value;
+      if (!oldest) return;
+      this._retireReadFd(oldest);
     }
-    const fd = await fsp.open(path.join(this.dir, segFileName(segId)), 'r');
-    this.readFds.set(segId, fd);
-    return fd;
   }
 
   async _closeAndDeleteSegment(segId) {
-    const fd = this.readFds.get(segId);
-    if (fd) { await fd.close().catch(() => {}); this.readFds.delete(segId); }
+    this._retireReadFd(this.readFds.get(segId));
     await fsp.unlink(path.join(this.dir, segFileName(segId))).catch(() => {});
   }
 
@@ -262,10 +349,14 @@ class CollectionStorage {
   }
 
   async _readRawAt(loc) {
-    const fd = await this._getReadFd(loc.segmentId);
-    const buf = Buffer.alloc(loc.length);
-    await fd.read(buf, 0, loc.length, loc.offset);
-    return buf;
+    const entry = await this._acquireReadFd(loc.segmentId);
+    try {
+      const buf = Buffer.alloc(loc.length);
+      await entry.fd.read(buf, 0, loc.length, loc.offset);
+      return buf;
+    } finally {
+      this._release(entry);
+    }
   }
 
   async _readAt(idStr, loc) {
@@ -854,9 +945,10 @@ class CollectionStorage {
       for (const [idStr, loc] of liveEntries) {
         const frameStart = loc.offset - HEADER_SIZE;
         const frameLen = HEADER_SIZE + loc.length;
-        const srcFd = await this._getReadFd(loc.segmentId);
+        const src = await this._acquireReadFd(loc.segmentId);
         const frameBuf = Buffer.alloc(frameLen);
-        await srcFd.read(frameBuf, 0, frameLen, frameStart);
+        try { await src.fd.read(frameBuf, 0, frameLen, frameStart); }
+        finally { this._release(src); }
         await newFd.write(frameBuf);
         newIndex.set(idStr, { segmentId: newSegId, offset: writeOffset + HEADER_SIZE, length: loc.length, version: loc.version, flags: loc.flags, deleted: false });
         writeOffset += frameLen;
