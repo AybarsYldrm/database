@@ -5,7 +5,7 @@ const { CollectionStorage } = require('./storage-engine');
 const { hkdf } = require('./crypto-core');
 const { ChangeHub, CHANGE_OPS } = require('./change-stream');
 const { planMigration, describeBlockers, SchemaMigrationError } = require('./schema-migration');
-const { mk } = require('./logger');
+const { adapt } = require('./logger');
 
 const STORAGE_OP_PUT = 1; // mirrors OP_PUT/OP_DELETE in storage-engine.js
 
@@ -204,7 +204,7 @@ class Database {
     // One logger per database, with each collection taking a child of it, so a line always
     // says which database AND which collection it came from. A host application can replace
     // the whole tree at once with logger.setSink().
-    this.log = logger ? (logger.child ? logger.child(String(name)) : logger) : mk(`fitdb:${name}`);
+    this.log = adapt(logger, logger ? String(name) : `fitdb:${name}`);
     this.dir = dir;
     this.ddk = ddk;
     this.acl = acl;
