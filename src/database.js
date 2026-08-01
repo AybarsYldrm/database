@@ -5,6 +5,7 @@ const { CollectionStorage } = require('./storage-engine');
 const { hkdf } = require('./crypto-core');
 const { ChangeHub, CHANGE_OPS } = require('./change-stream');
 const { planMigration, describeBlockers, SchemaMigrationError } = require('./schema-migration');
+const { mk } = require('./logger');
 
 const STORAGE_OP_PUT = 1; // mirrors OP_PUT/OP_DELETE in storage-engine.js
 
@@ -154,12 +155,18 @@ class Collection {
   // other direct-server operation). The server learns which bucket a record falls into
   // (e.g. "which day", for a day-width bucket on a timestamp), not its exact value -- the
   // bucket width is the dial between query utility and leakage, chosen per field.
-  async findRange(field, min, max) {
+  //
+  // `limit` stops the decrypt loop as soon as enough matches are in hand. That matters most
+  // on exactly the queries the sweep strategy serves: "everything due by now" hands back
+  // every id the field has indexed as a candidate, and without a limit the caller pays a
+  // decrypt for all of them on every poll even though it only ever consumes a batch.
+  async findRange(field, min, max, { limit = 0 } = {}) {
     const candidateIds = await this.storage.lookupRangeCandidates(field, min, max);
     const out = [];
     for (const id of candidateIds) {
       const r = await this.get(id);
       if (r && r[field] >= min && r[field] <= max) out.push(r);
+      if (limit && out.length >= limit) break;
     }
     return out;
   }
@@ -167,10 +174,14 @@ class Collection {
   // Native ordered range query for a plain (non-blind) diskBacked:true indexed numeric
   // field -- see CollectionStorage.lookupPlainRange for the confidentiality trade-off this
   // implies (the server learns real value order for this field, unlike rangeBucket).
-  async findRangePlain(field, min, max) {
+  async findRangePlain(field, min, max, { limit = 0 } = {}) {
     const candidateIds = await this.storage.lookupPlainRange(field, min, max);
     const out = [];
-    for (const id of candidateIds) { const r = await this.get(id); if (r) out.push(r); }
+    for (const id of candidateIds) {
+      const r = await this.get(id);
+      if (r) out.push(r);
+      if (limit && out.length >= limit) break;
+    }
     return out;
   }
 
@@ -187,9 +198,13 @@ class Collection {
 }
 
 class Database {
-  constructor({ dbId, name, dir, ddk, acl, manifest, idGenerator, persistManifest, changeBacklogSize = 1024 }) {
+  constructor({ dbId, name, dir, ddk, acl, manifest, idGenerator, persistManifest, changeBacklogSize = 1024, logger = null }) {
     this.dbId = dbId;
     this.name = name;
+    // One logger per database, with each collection taking a child of it, so a line always
+    // says which database AND which collection it came from. A host application can replace
+    // the whole tree at once with logger.setSink().
+    this.log = logger ? (logger.child ? logger.child(String(name)) : logger) : mk(`fitdb:${name}`);
     this.dir = dir;
     this.ddk = ddk;
     this.acl = acl;
@@ -233,6 +248,8 @@ class Database {
         segmentMaxBytes: def.options?.segmentMaxBytes,
         compress: def.options?.compress,
         onChange: this._changeSink(name),
+        logger: this.log,
+        name,
       });
       try {
         await storage.open();
@@ -291,6 +308,8 @@ class Database {
       segmentMaxBytes,
       compress,
       onChange: this._changeSink(name),
+      logger: this.log,
+      name,
     });
     // open() is async but collection creation is synchronous in the public API for
     // ergonomics; callers that need the open (AND the manifest update below) to have fully
@@ -300,6 +319,15 @@ class Database {
       options: { segmentMaxBytes, compress },
     };
     const ready = storage.open().then(() => this._persistManifest(this.manifest));
+    // defineCollection() is synchronous, so nothing is obliged to await `ready`. An open that
+    // failed then became an unhandled rejection, which on Node >= 15 terminates the process --
+    // a failure to open ONE collection taking down the entire database server. Attaching a
+    // handler here makes the rejection observed; `_readyPromise` still rejects for
+    // defineCollectionAsync/applyCollectionSchema callers, who do want to see it.
+    ready.catch((err) => this.log.error({
+      collection: name, error: err.message,
+      msg: 'collection failed to open; it will not be usable until the cause is fixed',
+    }));
     const collection = new Collection(name, schema, storage, { idGenerator: this._idGenerator, title, description });
     collection._readyPromise = ready;
     // `created` distinguishes this from "the collection already existed and needed no change",
@@ -350,6 +378,19 @@ class Database {
     collection._readyPromise = collection.storage
       .applySchema(schema, { rebuildIndexes: plan.needsRebuild })
       .then(() => this._persistManifest(this.manifest));
+    // Same reasoning as in defineCollection(): a migration nobody awaited must not be able to
+    // kill the process through an unhandled rejection.
+    collection._readyPromise.catch((err) => this.log.error({
+      collection: name, error: err.message, msg: 'schema migration failed',
+    }));
+
+    this.log.info({
+      collection: name,
+      changes: plan.changes.length,
+      rebuildIndexes: plan.needsRebuild,
+      schemaVersion: definition.schemaVersion,
+      msg: 'collection schema migrated',
+    });
 
     collection.migration = {
       changed: true,
@@ -485,9 +526,25 @@ class Database {
     return { records, lastSeq, lastCollSeq };
   }
 
+  /**
+   * Closes every collection, then drops subscribers.
+   *
+   * Each close is attempted independently. Letting one rejection escape the loop -- which is
+   * what a bare `await` in a for-of does -- meant a single collection failing to write its
+   * final snapshot left every collection after it in the iteration order open, holding its
+   * append handle and its whole read-FD pool, with no remaining reference to close them by.
+   */
   async close() {
-    for (const c of this.collections.values()) await c.storage.close();
+    const failures = [];
+    for (const c of this.collections.values()) {
+      try { await c.storage.close(); }
+      catch (err) { failures.push({ collection: c.name, error: err.message }); }
+    }
     this.changes.clear();
+    if (failures.length) {
+      this.log.error({ failures, msg: 'some collections did not close cleanly' });
+    }
+    return { closed: this.collections.size - failures.length, failures };
   }
 }
 

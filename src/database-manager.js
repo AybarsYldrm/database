@@ -10,6 +10,7 @@ const { AccessControlList, DB_PERMISSIONS } = require('./rbac');
 const { deriveManifestKeyFromKek, randomKey, wrapKey, unwrapKey, aesGcmEncrypt, aesGcmDecrypt } = require('./crypto-core');
 const { ClientSecretKeyProvider, randomClientSecret } = require('./key-provider');
 const { Database } = require('./database');
+const { mk } = require('./logger');
 
 // Manifest = small, infrequently-read structural metadata (schema definitions, ACL, wrapped
 // DDK). Encrypted as a whole with AES-256-GCM under manifestKey, plaintext JSON before
@@ -18,8 +19,9 @@ const { Database } = require('./database');
 // cost. Every actual DATA record, by contrast, goes through the binary TLV codec
 // (lib/binary-codec.js) and is what the "more efficient than JSON" requirement is about.
 class DatabaseManager {
-  constructor({ baseDir, snowflake, sessionTtlMs = 15 * 60 * 1000 }) {
+  constructor({ baseDir, snowflake, sessionTtlMs = 15 * 60 * 1000, logger = null }) {
     this.baseDir = baseDir;
+    this.log = logger || mk('fitdb:manager');
     this.snowflake = snowflake || new SnowflakeGenerator();
     this.sessionTtlMs = sessionTtlMs;
     this.sessions = new Map(); // dbId -> { ddk, timer }
@@ -172,8 +174,9 @@ class DatabaseManager {
 
     this._cacheSession(dbId, ddk);
     const persistManifest = (m) => this._writeManifest(dir, manifestKey, m);
-    const db = new Database({ dbId, name, dir, ddk, acl, manifest, idGenerator: this._idGen(), persistManifest });
+    const db = new Database({ dbId, name, dir, ddk, acl, manifest, idGenerator: this._idGen(), persistManifest, logger: this.log });
     this.openDatabases.set(dbId, db);
+    this.log.info({ dbId, name, ownerId, dir, msg: 'database created' });
     return { db, dbId, clientSecret: clientSecretOut };
   }
 
@@ -214,12 +217,15 @@ class DatabaseManager {
     this._cacheSession(dbId, ddk);
 
     const persistManifest = (m) => this._writeManifest(dir, manifestKey, m);
-    const db = new Database({ dbId, name: manifest.name, dir, ddk, acl, manifest, idGenerator: this._idGen(), persistManifest });
+    const db = new Database({ dbId, name: manifest.name, dir, ddk, acl, manifest, idGenerator: this._idGen(), persistManifest, logger: this.log });
+    const done = this.log.timer('open database', { warnAboveMs: 5000 });
     try {
       await db._openExistingCollections();
+      done({ dbId, name: manifest.name, collections: db.collections.size });
     } catch (err) {
       // Whatever did open before the failure still holds descriptors; this handle is being
       // thrown away, so they have to go back now rather than at the next garbage collection.
+      this.log.error({ dbId, error: err.message, msg: 'database failed to open' });
       await db.close().catch(() => {});
       throw err;
     }

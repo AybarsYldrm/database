@@ -111,14 +111,14 @@ class RemoteCollection {
   }
 
   /** Bucketed range query over a `rangeBucket` field; the server never learns exact values. */
-  async findRange(field, min, max) {
-    const res = await this._call('FindRange', { field, min: String(min), max: String(max), plain: false });
+  async findRange(field, min, max, { limit = 0 } = {}) {
+    const res = await this._call('FindRange', { field, min: String(min), max: String(max), plain: false, limit });
     return JSON.parse(res.payloadJson);
   }
 
   /** Ordered scan over a plain `diskBacked` index. The server does learn value order here. */
-  async findRangePlain(field, min, max) {
-    const res = await this._call('FindRange', { field, min: String(min), max: String(max), plain: true });
+  async findRangePlain(field, min, max, { limit = 0 } = {}) {
+    const res = await this._call('FindRange', { field, min: String(min), max: String(max), plain: true, limit });
     return JSON.parse(res.payloadJson);
   }
 
