@@ -557,7 +557,63 @@ smaller correctness surface than leveled compaction, at the cost of O(total) flu
 
 ---
 
-## 10. Known limitations
+## 10. Logging: what it says, and where
+
+```js
+const { createLogger, createDatabaseServer } = require('@fitfak/database');
+const log = createLogger('db');
+createDatabaseServer({ baseDir, logger: log, /* … */ });
+```
+
+Level comes from `FITDB_LOG_LEVEL` (`TRACE`/`DEBUG`/`INFO`/`WARN`/`ERROR`), **`DEBUG` by
+default**; `FITDB_LOG_JSON=1` switches to one JSON object per line for a collector. Anything
+whose key looks like key material (`secret`, `token`, `ddk`, `privateKey`, …) is masked at
+every level — "we only print it at trace" is not protection when the person who turned trace
+on is about to paste the output somewhere.
+
+**Pass any logger you like.** A logger with only `info`/`warn`/`error` — `console`, for
+instance — is wrapped rather than trusted, so the engine gets the full surface it calls
+(`child`, `timer`, `hex`) and your logger still receives every line. Passing `logger: console`
+works, but prints raw objects with no timestamp or level, because that is what `console.info`
+does with an object; `createLogger` is what produces the formatted output below.
+
+| Component | Level | What it tells you |
+|---|---|---|
+| `fitdb:server` | INFO | listening (host, port, enrolment on/off, principals); database created/opened; collection defined/migrated |
+| `fitdb:server` | DEBUG | **every RPC**: name, principal, dbId, collection, duration |
+| `fitdb:server` | WARN | an RPC refused, with its gRPC status — wrong secret, no ACL entry, unknown collection, a refused migration |
+| `fitdb:server` | ERROR | an unexpected handler failure, with stack |
+| enrolment | INFO/WARN | issuance (principal, method, serial, expiry) and **refusal with the real reason** — the usual answer to "why can't this client connect", since the client only ever sees `PERMISSION_DENIED` |
+| `fitdb:manager` | INFO | database created / opened (timed) / failed to open |
+| `fitdb:<db>:<collection>` | DEBUG | collection open, index rebuild, compaction, range-query strategy — all timed, and **escalating to WARN when slow**, which is how a query that quietly got 100× more expensive announces itself |
+| `fitdb:<db>:<collection>` | WARN | an index snapshot discarded in favour of a full replay; a collection that failed to open |
+
+A line is `HH:MM:SS.mmm LEVEL [component] message` with its detail as an indented JSON block
+beneath — nested detail (a migration's change list, a query's strategy and counts) stays
+readable instead of being flattened onto one line.
+
+```
+13:10:40.639 INFO  [fitdb:server] database server listening
+{
+  "host": "127.0.0.1",
+  "port": 51572,
+  "enrolment": "enabled",
+  "principals": ["idp-service", "smtp-service"],
+  "logLevel": "DEBUG"
+}
+13:10:40.705 DEBUG [fitdb:server] rpc ok
+{
+  "rpc": "FindRange",
+  "principal": "smtp-service",
+  "dbId": "358990028442963968",
+  "collection": "outbound_queue",
+  "ms": 12
+}
+```
+
+---
+
+## 11. Known limitations
 
 - One writer process per data directory. Every serialization guarantee above is in-process;
   two server processes over the same `baseDir` would each keep their own segment offsets and

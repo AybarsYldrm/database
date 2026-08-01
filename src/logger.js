@@ -37,8 +37,14 @@ const BOLD = '\x1b[1m';
 // FITDB_LOG_LEVEL is the name that belongs to this package; DTLS_LOG_LEVEL is honoured too
 // so a process already running with the sibling transport's logger turned up does not have
 // to set two variables to see the same depth of detail.
-const envLevel = String(process.env.FITDB_LOG_LEVEL || process.env.DTLS_LOG_LEVEL || 'INFO').toUpperCase();
-let minLevel = LEVELS[envLevel] ?? LEVELS.INFO;
+//
+// DEBUG by default, matching the rest of the stack. INFO was the earlier default and it was
+// the wrong call: it hid every timing and every strategy decision, so the engine looked
+// silent and "where did you actually log anything?" was a fair question. Per-request lines
+// live at DEBUG, byte-level detail at TRACE, and a deployment that wants quiet sets
+// FITDB_LOG_LEVEL=INFO.
+const envLevel = String(process.env.FITDB_LOG_LEVEL || process.env.DTLS_LOG_LEVEL || 'DEBUG').toUpperCase();
+let minLevel = LEVELS[envLevel] ?? LEVELS.DEBUG;
 
 let colorEnabled = !!process.stdout.isTTY && process.env.NO_COLOR !== '1';
 let jsonMode = String(process.env.FITDB_LOG_JSON || '') === '1';
@@ -98,17 +104,23 @@ function redact(fields) {
   return out;
 }
 
-function stringifyRest(fields) {
-  const parts = [];
+/**
+ * Everything except `msg`, as an indented JSON block.
+ *
+ * This is the presentation the rest of the FITFAK stack's logger uses, and matching it is not
+ * cosmetic: a database line usually carries nested detail (a migration's change list, a
+ * failure's per-MX breakdown, a query's strategy and counts), and flattening that onto one
+ * `k=v` line is where it stops being readable exactly when it matters most.
+ */
+function metaBlock(fields) {
+  const rest = {};
   for (const [k, v] of Object.entries(fields)) {
-    if (k === 'msg') continue;
-    if (v === null) { parts.push(`${k}=null`); continue; }
-    if (Buffer.isBuffer(v)) { parts.push(`${k}=<${v.length}B>`); continue; }
-    if (typeof v === 'object') { parts.push(`${k}=${safeJson(v)}`); continue; }
-    const s = String(v);
-    parts.push(/[\s"=]/.test(s) ? `${k}="${s.replace(/"/g, '\\"')}"` : `${k}=${s}`);
+    if (k === 'msg' || v === undefined) continue;
+    rest[k] = v;
   }
-  return parts.join(' ');
+  if (Object.keys(rest).length === 0) return '';
+  try { return JSON.stringify(rest, bufReplacer, 2); }
+  catch { return String(rest); }
 }
 
 function hexDump(buf, { width = 16, indent = '  ', maxBytes = 512 } = {}) {
@@ -153,8 +165,8 @@ function emit(levelName, component, fields, localSink = null) {
   const color = c(LEVEL_COLORS[levelName] || '');
   const head = `${c(DIM)}${ts()}${c(RESET)} ${color}${c(BOLD)}${levelName.padEnd(5)}${c(RESET)} ${color}[${component}]${c(RESET)}`;
   const message = norm.msg != null ? ` ${norm.msg}` : '';
-  const rest = stringifyRest(norm);
-  stream.write(`${head}${message}${rest ? ` ${c(DIM)}${rest}${c(RESET)}` : ''}\n`);
+  const meta = metaBlock(norm);
+  stream.write(`${head}${message}${meta ? `\n${c(DIM)}${meta}${c(RESET)}` : ''}\n`);
 }
 
 /**

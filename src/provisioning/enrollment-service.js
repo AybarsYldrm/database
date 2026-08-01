@@ -86,7 +86,15 @@ function createEnrollmentService({
       // Everything the attestor rejects comes back as one status with one message. Telling an
       // unauthenticated caller whether the service name was unknown, the nonce replayed or the
       // HMAC wrong is an oracle for probing the enrolment surface.
-      log?.warn?.(`[enrol] ${kind} denied for '${req.serviceName || 'unknown'}': ${err.message}`);
+      // A denied enrolment is the most common reason a client cannot connect at all, and on
+      // the client side it surfaces only as PERMISSION_DENIED with a deliberately vague
+      // message. This line is the one place the actual reason is recorded.
+      log?.warn?.({
+        kind,
+        serviceName: req.serviceName || 'unknown',
+        reason: err.message,
+        msg: 'enrolment denied — this client cannot connect until it is resolved',
+      });
       events.emit('denied', { kind, serviceName: req.serviceName, reason: err.message, peer });
       throw new GrpcError(GRPC_STATUS.PERMISSION_DENIED, 'enrolment rejected');
     }
@@ -132,7 +140,14 @@ function createEnrollmentService({
       notAfter,
       peer,
     };
-    log?.info?.(`[enrol] ${kind} issued '${grant.principal}' via ${result.method}, expires ${new Date(notAfter).toISOString()}`);
+    log?.info?.({
+      kind,
+      principal: grant.principal,
+      method: result.method,
+      serialNumber: result.serialNumber || undefined,
+      notAfter: new Date(notAfter).toISOString(),
+      msg: 'enrolment issued',
+    });
     events.emit('issued', result);
 
     return {
