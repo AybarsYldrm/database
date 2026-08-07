@@ -18,8 +18,8 @@ const { toJson, readPayload, writePayload, recordToJsonObject, recordsToJson } =
 //
 // Shape of the deployment this is built for:
 //
-//   - The server obtains its own certificate from the central authority (ACME). It is not a
-//     CA and cannot sign anything; see provisioning/ca-backend.js.
+//   - The server obtains its own certificate from the central authority. It is not a CA and
+//     cannot sign anything; see provisioning/ca-backend.js.
 //   - A service that has never connected before reaches the enrolment endpoints over a
 //     server-authenticated-only channel, proves entitlement, receives a certificate, and
 //     upgrades to mTLS. Nothing in DatabaseService is reachable before that.
@@ -28,6 +28,13 @@ const { toJson, readPayload, writePayload, recordToJsonObject, recordsToJson } =
 //
 // Every method below therefore declares `minSecurityLevel: 'mtls'`. That is enforced by the
 // transport before the handler runs, so it cannot be forgotten in a handler.
+//
+// ADMISSION, when `options.admission` is configured, adds a step in front of all of that: the
+// server starts SEALED, wearing an ephemeral self-signed certificate, and serves nobody until
+// the identity provider has connected and handed it a real one. See provisioning/admission-gate.js
+// for why the ordering is a requirement rather than a preference. Without `options.admission`
+// the server behaves exactly as before, which is the right default for a deployment whose
+// certificates are managed entirely outside this process.
 
 const DEFAULT_OPTIONS = {
   packageName: 'custom.network',
@@ -71,6 +78,8 @@ class DatabaseServer extends EventEmitter {
       defaultRoles: options.defaultRoles || null,
       subjectField: options.subjectField || 'CN',
       pinnedIssuers: options.pinnedIssuers || null,
+      trustDomain: options.trustDomain || null,
+      requireSpiffeId: options.requireSpiffeId || false,
     });
 
     // Remembers which secret opened which database, so a session that the manager's TTL has
@@ -90,8 +99,88 @@ class DatabaseServer extends EventEmitter {
     });
     this._ownsApp = !options.app;
 
+    // Admission is set up before the services are registered, because it wraps both the
+    // principal resolver (which guards the data plane) and the enrolment attestor (which guards
+    // issuance). A wrapper installed after registration would leave whichever service was
+    // registered first holding an unwrapped reference, which is the same as having no gate.
+    if (options.admission) this._setUpAdmission(options.admission);
+
     this._registerDatabaseService();
     if (options.enrollment) this._registerEnrollmentService(options.enrollment);
+  }
+
+  // ---- admission ----------------------------------------------------------------------------
+
+  /**
+   * Starts this server sealed and mounts the control plane that unseals it.
+   *
+   * @param {object}  admission
+   * @param {string}  admission.controlPrincipal   the identity provider's principal name
+   * @param {Buffer}  admission.bootstrapSecret    pre-shared with the identity provider
+   * @param {object}  admission.bootstrapIdentity  { key, cert, ca, fingerprint256 } -- ephemeral,
+   *                                               from provisioning/bootstrap-identity.js
+   * @param {string} [admission.controlSpiffeId]
+   * @param {number} [admission.holdMs]
+   */
+  _setUpAdmission(admission) {
+    // eslint-disable-next-line global-require
+    const { createAdmissionGate } = require('../provisioning/admission-gate');
+    // eslint-disable-next-line global-require
+    const { createControlPlaneService } = require('../provisioning/control-plane-service');
+
+    const bootstrap = admission.bootstrapIdentity || null;
+    // What the server falls back to when a provisioned identity is never committed. Captured
+    // once here rather than read from `admission` later, so that a caller mutating their own
+    // options object cannot change what "roll back" means after the fact.
+    const bootstrapContext = bootstrap
+      ? { key: bootstrap.key, cert: bootstrap.cert, ca: bootstrap.ca }
+      : null;
+
+    this.gate = createAdmissionGate({
+      controlPrincipal: admission.controlPrincipal,
+      controlSpiffeId: admission.controlSpiffeId || null,
+      holdMs: admission.holdMs,
+      logger: this._log,
+      installIdentity: ({ key, cert, ca }) => {
+        this._clientTrustAnchors = ca;
+        this.rotateServerCertificate({ key, cert, ca });
+      },
+      restoreIdentity: () => {
+        if (!bootstrapContext) return;
+        this._clientTrustAnchors = bootstrapContext.ca;
+        this.rotateServerCertificate(bootstrapContext);
+      },
+    });
+
+    this.resolvePrincipal = this.gate.wrapPrincipalResolver(this.resolvePrincipal);
+
+    this._controlPlane = createControlPlaneService({
+      bootstrapSecret: admission.bootstrapSecret,
+      gate: this.gate,
+      serverName: admission.serverName || '',
+      bootstrapFingerprint: () => bootstrap?.fingerprint256 || '',
+      logger: this._log,
+    });
+    this.app.registerController(admission.serviceName || 'ControlPlaneService', this._controlPlane.controller);
+
+    this.gate.on('opened', (event) => this.emit('admissionOpened', event));
+    this.gate.on('sealed', (event) => this.emit('admissionSealed', event));
+    return this;
+  }
+
+  /**
+   * The PEM anchors this server currently validates client certificates against, as installed
+   * by the control plane. Null while sealed with no bootstrap identity.
+   *
+   * Exposed because the CA backend needs them: an enrolling peer is handed these so it can
+   * validate this server on its next, mutually authenticated connection, and they arrive from
+   * the identity provider rather than from local configuration.
+   */
+  get clientTrustAnchors() {
+    if (!this._clientTrustAnchors) return null;
+    const matches = String(this._clientTrustAnchors)
+      .match(/-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g);
+    return matches ? matches.map((pem) => `${pem}\n`) : null;
   }
 
   // ---- registration -------------------------------------------------------------------------
@@ -109,9 +198,21 @@ class DatabaseServer extends EventEmitter {
     // Required lazily: a deployment whose certificates are managed entirely outside this
     // process has no reason to configure a CA backend, and should not be made to.
     const { createEnrollmentService } = require('../provisioning/enrollment-service');
+    // While the server is sealed, issuance is closed to everyone but the identity provider.
+    // Without this a service could collect a perfectly valid certificate during the bootstrap
+    // window and walk in the instant the gate opened -- the same escalation the gate exists to
+    // prevent, deferred by a few seconds.
+    const gated = this.gate && !enrollment.controller
+      ? {
+        ...enrollment,
+        attestor: this.gate.wrapAttestor(enrollment.attestor),
+        renewalAttestor: enrollment.renewalAttestor ? this.gate.wrapAttestor(enrollment.renewalAttestor) : null,
+      }
+      : enrollment;
+
     const service = enrollment.controller
       ? enrollment
-      : createEnrollmentService({ logger: this._log, ...enrollment });
+      : createEnrollmentService({ logger: this._log, ...gated });
 
     this.enrollment = service;
     this._enrolmentEnabled = true;
@@ -894,6 +995,10 @@ class DatabaseServer extends EventEmitter {
       port: this.address()?.port ?? port,
       baseDir: this.options.baseDir,
       enrolment: this._enrolmentEnabled ? 'enabled' : 'disabled',
+      // The single most useful line when nothing can connect: a sealed server refuses every
+      // principal by design, and that has to be visible at startup rather than inferred from a
+      // wall of FAILED_PRECONDITION on the client side.
+      admission: this.gate ? this.gate.state : 'not configured',
       principals: Object.keys(this.options.principals || {}),
       logLevel: getLevel(),
       msg: 'database server listening',
@@ -924,6 +1029,9 @@ class DatabaseServer extends EventEmitter {
   address() { return this.app.address(); }
 
   async close(options) {
+    // Released first: the hold timer holds a reference to this server, and a shutdown that
+    // leaves it armed can fire a re-seal against an application that is already closing.
+    this.gate?.close();
     if (this._ownsApp) await this.app.close(options);
     for (const dbId of [...this.manager.openDatabases.keys()]) await this.manager.closeDatabase(dbId);
     this._secrets.clear();

@@ -3,6 +3,7 @@
 const { EventEmitter } = require('node:events');
 const { GRPC_STATUS, GrpcError, SECURITY_LEVELS } = require('@fitfak/grpc');
 const { computeEnrolmentProof, EnrolmentDenied } = require('./attestor');
+const { assertIdentityMatchesGrant, assertSpiffeMatchesGrant } = require('./identity-binding');
 
 // The Registration Authority half of the bootstrap flow, exposed as a gRPC service.
 //
@@ -50,6 +51,14 @@ ENROLMENT_SCHEMAS.EnrollmentService_ReenrollReq = ENROLMENT_SCHEMAS.EnrollmentSe
 ENROLMENT_SCHEMAS.EnrollmentService_ReenrollRes = ENROLMENT_SCHEMAS.EnrollmentService_EnrollRes;
 
 const DEFAULT_VALIDITY_DAYS = 397;
+
+// Below this, a certificate is "short-lived" in the BeyondCorp sense: it expires faster than a
+// revocation could realistically propagate, so its own expiry IS the revocation mechanism.
+// Renewal for those has to start at half the lifetime rather than two thirds -- with a five
+// minute certificate, two thirds leaves 100 seconds for a retry, and a single slow CA round
+// trip inside that window is an outage.
+const SHORT_LIVED_THRESHOLD_MS = 60 * 60 * 1000;
+const SHORT_LIVED_RENEWAL_RATIO = 0.5;
 
 /**
  * @param {object}   opts
@@ -112,20 +121,29 @@ function createEnrollmentService({
     // disagree, and the safe response to that is refusal, not quiet narrowing.
     assertIdentityMatchesGrant(parsed, grant);
 
-    const validityDays = grant.validityDays || defaultValidityDays;
+    // Seconds win when both are present: an attestor that names a short lifetime is making a
+    // deliberate statement about this credential, and silently rounding it up to whole days
+    // would turn a five-minute session certificate into a year-long one.
+    const validitySeconds = grant.validitySeconds || null;
+    const validityDays = validitySeconds ? null : (grant.validityDays || defaultValidityDays);
+    const requestedLifetimeMs = validitySeconds ? validitySeconds * 1000 : validityDays * 86400000;
+
     const issued = await caBackend.issue({
       csrPem: req.csrPem,
       subject: grant.subject,
       altNames: grant.altNames,
+      spiffeId: grant.spiffeId || null,
       roles: grant.roles,
-      validityDays,
+      ...(validitySeconds ? { validitySeconds } : { validityDays }),
     });
 
     const anchors = await caBackend.getTrustAnchors();
-    const notAfter = issued.notAfter ? new Date(issued.notAfter).getTime() : Date.now() + validityDays * 86400000;
+    const notAfter = issued.notAfter ? new Date(issued.notAfter).getTime() : Date.now() + requestedLifetimeMs;
     // Telling the peer when to come back is what keeps renewal from being a cron job that
     // drifts out of sync with the actual expiry.
-    const renewAfter = Date.now() + Math.floor((notAfter - Date.now()) * renewalRatio);
+    const lifetimeMs = notAfter - Date.now();
+    const ratio = lifetimeMs <= SHORT_LIVED_THRESHOLD_MS ? SHORT_LIVED_RENEWAL_RATIO : renewalRatio;
+    const renewAfter = Date.now() + Math.floor(lifetimeMs * ratio);
 
     // Only now is the credential considered spent -- see the note on `commit` in attestor.js.
     // A request that authenticated but was rejected for asking the wrong identity, or that
@@ -218,60 +236,12 @@ function createEnrollmentService({
   return { controller, schemas: ENROLMENT_SCHEMAS, events, caBackend };
 }
 
-/**
- * A CSR may not ask for an identity the grant does not cover. Both directions matter: a CN
- * the grant did not authorise is an obvious escalation, and a SAN the grant did not authorise
- * is the same escalation wearing a different hat -- most TLS stacks match on SAN, not CN, so
- * checking only the CN would leave the actually-load-bearing field unchecked.
- */
-function assertIdentityMatchesGrant(parsedCsr, grant) {
-  const requestedCn = parsedCsr.subject?.CN;
-  const grantedCn = grant.subject?.CN;
-
-  // Fail closed when the CN cannot be read.
-  //
-  // This guard used to be `if (grantedCn && requestedCn && ...)`, which meant a backend whose
-  // parseCsr did not decode a subject made the whole comparison evaporate -- no error, no
-  // warning, just an authorisation check that silently stopped running. The @fitfak/ssl
-  // backend was exactly that case, so a peer granted 'idp-service' could enrol a CSR naming
-  // any other principal and be certified as it. A check that no-ops when its input is missing
-  // is worse than no check at all, because it reads like protection.
-  if (grantedCn && requestedCn === undefined) {
-    throw new GrpcError(GRPC_STATUS.INTERNAL,
-      'the CA backend did not report a subject for this CSR, so the requested identity cannot be '
-      + 'checked against the grant; refusing to issue');
-  }
-  if (grantedCn && requestedCn !== grantedCn) {
-    throw new GrpcError(GRPC_STATUS.PERMISSION_DENIED,
-      `the request asks for CN='${requestedCn}' but this credential only authorises CN='${grantedCn}'`);
-  }
-
-  // A second CN would pass the equality test above on its first occurrence while a relying
-  // party that reads the last one sees something else entirely.
-  if (Array.isArray(parsedCsr.commonNames) && parsedCsr.commonNames.length > 1) {
-    throw new GrpcError(GRPC_STATUS.PERMISSION_DENIED,
-      'the certificate signing request carries more than one common name');
-  }
-
-  const allowed = new Set((grant.altNames || []).map(normalizeAltName));
-  if (grantedCn) allowed.add(normalizeAltName(grantedCn));
-
-  for (const requested of parsedCsr.altNames || []) {
-    if (!allowed.has(normalizeAltName(requested))) {
-      throw new GrpcError(GRPC_STATUS.PERMISSION_DENIED,
-        `the request asks for subjectAltName '${requested}', which this credential does not authorise`);
-    }
-  }
-}
-
-function normalizeAltName(value) {
-  return String(value).replace(/^(DNS|IP Address|IP|email|URI):/i, '').trim().toLowerCase();
-}
-
 module.exports = {
   createEnrollmentService,
   ENROLMENT_SCHEMAS,
   computeEnrolmentProof,
   EnrolmentDenied,
   assertIdentityMatchesGrant,
+  assertSpiffeMatchesGrant,
+  SHORT_LIVED_THRESHOLD_MS,
 };

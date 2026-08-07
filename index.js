@@ -28,7 +28,12 @@ const lazy = {
   get attestor() { return require('./src/provisioning/attestor'); },
   get idpAttestor() { return require('./src/provisioning/idp-attestor'); },
   get caBackend() { return require('./src/provisioning/ca-backend'); },
+  get idpCaBackend() { return require('./src/provisioning/idp-ca-backend'); },
   get csrProvider() { return require('./src/provisioning/csr-provider'); },
+  get controlPlaneService() { return require('./src/provisioning/control-plane-service'); },
+  get controlPlaneClient() { return require('./src/provisioning/control-plane-client'); },
+  get admissionGate() { return require('./src/provisioning/admission-gate'); },
+  get bootstrapIdentity() { return require('./src/provisioning/bootstrap-identity'); },
 };
 
 module.exports = {
@@ -78,6 +83,23 @@ module.exports = {
   get createFitfakSslCaBackend() { return lazy.caBackend.createFitfakSslCaBackend; },
   get createAcmeCaBackend() { return lazy.caBackend.createAcmeCaBackend; },
   get createCustomCaBackend() { return lazy.caBackend.createCustomCaBackend; },
+  // Signing delegated to the identity provider -- the backend that makes "this database is a
+  // Registration Authority, never a CA" enforced rather than aspirational.
+  get createIdpCaBackend() { return lazy.idpCaBackend.createIdpCaBackend; },
+  get createSslCsrParser() { return lazy.caBackend.createSslCsrParser; },
   get createFitfakSslCsrProvider() { return lazy.csrProvider.createFitfakSslCsrProvider; },
   get createCustomCsrProvider() { return lazy.csrProvider.createCustomCsrProvider; },
+
+  // ---- provisioning: sealed bootstrap --------------------------------------------------------
+  // The database starts serving nobody and is unsealed by the identity provider pushing in a
+  // server certificate. See src/provisioning/admission-gate.js for why the ordering is a
+  // requirement and not a preference.
+  get createAdmissionGate() { return lazy.admissionGate.createAdmissionGate; },
+  get AdmissionGate() { return lazy.admissionGate.AdmissionGate; },
+  get GATE_STATES() { return lazy.admissionGate.GATE_STATES; },
+  get createEphemeralBootstrapIdentity() { return lazy.bootstrapIdentity.createEphemeralBootstrapIdentity; },
+  get createControlPlaneService() { return lazy.controlPlaneService.createControlPlaneService; },
+  get generateBootstrapSecret() { return lazy.controlPlaneService.generateBootstrapSecret; },
+  get provisionServerIdentity() { return lazy.controlPlaneClient.provisionServerIdentity; },
+  get readAdmissionStatus() { return lazy.controlPlaneClient.readAdmissionStatus; },
 };

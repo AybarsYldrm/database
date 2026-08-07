@@ -5,7 +5,10 @@ const fsp = require('node:fs/promises');
 const { X509Certificate } = require('node:crypto');
 
 const { createFitfakSslCaBackend } = require('../src/provisioning/ca-backend');
-const { assertIdentityMatchesGrant } = require('../src/provisioning/enrollment-service');
+// From identity-binding rather than enrollment-service: the service module pulls in the
+// transport, which meant this suite crashed on a missing @fitfak/grpc before it ever reached
+// the @fitfak/ssl guard below and could report an honest SKIP.
+const { assertIdentityMatchesGrant } = require('../src/provisioning/identity-binding');
 
 // What identity an enrolling peer actually ends up holding.
 //

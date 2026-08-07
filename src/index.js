@@ -29,6 +29,12 @@ const { createPublicObjectHandler, createPublicObjectServer } = require('./objec
 const { ChangeHub, ReplicatedView, CHANGE_OPS } = require('./change-stream');
 const { diffSchemas, planMigration, describeBlockers, SchemaMigrationError, SAFETY: MIGRATION_SAFETY } = require('./schema-migration');
 const { SecretStore, SECRETS_SCHEMA_FIELDS, SECRET_KINDS, SECRET_STATES } = require('./secret-store');
+const { PkiVault, PkiVaultError, AUTHORITY_ROLES, PURPOSES } = require('./pki-vault');
+// No transport dependency in either of these, so they belong in the engine barrel rather than
+// behind the lazy getters in the root index: a process that only wants to parse a SPIFFE ID
+// should not have to have @fitfak/grpc installed.
+const spiffe = require('./provisioning/spiffe');
+const identityBinding = require('./provisioning/identity-binding');
 const { DnsStore, ZoneCache, DNS_RECORDS_SCHEMA_FIELDS, DNS_RECORD_TYPES } = require('./dns-store');
 const logger = require('./logger');
 
@@ -55,6 +61,10 @@ module.exports = {
   ChangeHub, ReplicatedView, CHANGE_OPS,
   diffSchemas, planMigration, describeBlockers, SchemaMigrationError, MIGRATION_SAFETY,
   SecretStore, SECRETS_SCHEMA_FIELDS, SECRET_KINDS, SECRET_STATES,
+  PkiVault, PkiVaultError, AUTHORITY_ROLES, PKI_PURPOSES: PURPOSES,
+  spiffe,
+  assertIdentityMatchesGrant: identityBinding.assertIdentityMatchesGrant,
+  assertSpiffeMatchesGrant: identityBinding.assertSpiffeMatchesGrant,
   DnsStore, ZoneCache, DNS_RECORDS_SCHEMA_FIELDS, DNS_RECORD_TYPES,
   // Structured logging. `logger.configure({ sink })` hands every engine line to a host
   // application's logger, which is how @fitfak/smtp gets database internals in its own stream.

@@ -1,6 +1,7 @@
 'use strict';
 
 const crypto = require('node:crypto');
+const spiffe = require('./spiffe');
 
 // How a peer that has no certificate yet proves it deserves one.
 //
@@ -17,11 +18,23 @@ const crypto = require('node:crypto');
 //
 // where `grant` is what the peer is allowed to become:
 //
-//   { principal, subject: {CN,...}, altNames: [], roles: [], validityDays, singleUse }
+//   { principal, spiffeId, subject: {CN,...}, altNames: [], roles: [],
+//     validityDays | validitySeconds, singleUse }
 //
 // Throwing rejects the enrolment. Returning a grant does NOT issue anything -- the enrolment
 // service still checks the CSR against the grant, so an attestor that is too generous cannot
 // by itself hand out an identity the CSR did not ask for, and vice versa.
+//
+// `spiffeId` is the identity that actually matters. A grant that carries one is saying "this
+// peer may hold this SPIFFE ID", and the enrolment service will refuse a CSR that asks for any
+// other. The CN is kept alongside it as a display string and as the key into allow-lists that
+// predate SPIFFE, not as an authorisation input -- see spiffe.js for why that split exists.
+//
+// `validitySeconds` is the short-lived path. A workload certificate measured in minutes is the
+// BeyondCorp model: the credential expires faster than a revocation could propagate, so
+// rotation replaces revocation for everything except a compromise that has to be stopped
+// immediately. `validityDays` remains for the service identities where minutes would mean
+// re-issuing thousands of times a day for no gain.
 
 const ENROLMENT_CONTEXT = 'fitdb-enroll-v1';
 
@@ -121,10 +134,12 @@ function createSharedSecretAttestor({
 
       return {
         principal: serviceName,
+        spiffeId: entry.spiffeId || null,
         subject: entry.subject || { CN: serviceName },
         altNames: entry.altNames || [],
         roles: entry.roles || [],
         validityDays: entry.validityDays,
+        validitySeconds: entry.validitySeconds,
         // The use is spent only once a certificate has actually been issued. Spending it here
         // would mean any request that authenticates but is then rejected downstream -- a CSR
         // asking for the wrong name, a CA that happens to be unreachable -- permanently burns
@@ -156,10 +171,12 @@ function createTokenAttestor({ verify, name = 'token' }) {
       if (!grant) throw new EnrolmentDenied('enrolment token was not accepted');
       return {
         principal: grant.principal || grant.subject?.CN,
+        spiffeId: grant.spiffeId || null,
         subject: grant.subject || { CN: grant.principal },
         altNames: grant.altNames || [],
         roles: grant.roles || [],
         validityDays: grant.validityDays,
+        validitySeconds: grant.validitySeconds,
       };
     },
   };
@@ -174,23 +191,45 @@ function createTokenAttestor({ verify, name = 'token' }) {
  * The renewed identity is taken from the *existing certificate*, never from the request. A
  * peer renewing `dns-resolver` cannot ask to come back as `admin`.
  */
-function createRenewalAttestor({ roleResolver = null, validityDays = undefined } = {}) {
+function createRenewalAttestor({
+  roleResolver = null, validityDays = undefined, validitySeconds = undefined, trustDomain = null,
+} = {}) {
   return {
     name: 'mtls-renewal',
     async attest({ peer }) {
       if (peer.securityLevel !== 'mtls' || !peer.certificate) {
         throw new EnrolmentDenied('re-enrolment requires an authenticated mTLS connection');
       }
-      const commonName = peer.certificate.commonName;
-      if (!commonName) throw new EnrolmentDenied('the presented certificate has no common name to renew');
+
+      // The SPIFFE ID, when the certificate carries one, is the identity being renewed --
+      // not the CN. Renewing from the CN while the certificate is authenticated by its URI
+      // SAN would let the two drift apart across a renewal, and a certificate whose name means
+      // one thing to the issuer and another to the verifier is worse than no renewal at all.
+      const spiffeId = spiffe.fromCertificate(peer.certificate);
+      if (trustDomain && spiffeId && spiffeId.trustDomain !== trustDomain) {
+        throw new EnrolmentDenied(`this certificate belongs to trust domain '${spiffeId.trustDomain}', not '${trustDomain}'`);
+      }
+
+      const commonName = peer.certificate.commonName || peer.certificate.subject?.CN || null;
+      if (!spiffeId && !commonName) {
+        throw new EnrolmentDenied('the presented certificate carries neither a SPIFFE ID nor a common name to renew');
+      }
+
+      const altNames = (peer.certificate.altNames || [])
+        .map((entry) => String(entry).replace(/^(DNS|IP Address|IP|email|URI):/i, '').trim())
+        .filter(Boolean);
+
       return {
-        principal: commonName,
+        // The principal stays the CN when there is one, because that is the key the server's
+        // allow-list and every existing deployment is written against. The SPIFFE ID rides
+        // alongside and is what the CSR is actually checked against.
+        principal: commonName || spiffeId.uri,
+        spiffeId: spiffeId ? spiffeId.uri : null,
         subject: peer.certificate.subject || { CN: commonName },
-        altNames: peer.certificate.altNames
-          .map((entry) => entry.replace(/^(DNS|IP Address|email|URI):/i, '').trim())
-          .filter(Boolean),
+        altNames,
         roles: roleResolver ? await roleResolver(peer.certificate) : [],
         validityDays,
+        validitySeconds,
       };
     },
   };

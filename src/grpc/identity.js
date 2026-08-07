@@ -3,6 +3,7 @@
 const crypto = require('node:crypto');
 const { GRPC_STATUS, GrpcError, SECURITY_LEVELS } = require('@fitfak/grpc');
 const { DB_PERMISSIONS, combine } = require('../rbac');
+const spiffe = require('../provisioning/spiffe');
 
 // Turning an authenticated TLS peer into a principal the database can make decisions about.
 //
@@ -36,13 +37,21 @@ const ROLE_PERMISSIONS = Object.freeze({
 
 /**
  * @param {object}   opts
- * @param {string}  [opts.subjectField='CN']  'CN' | 'OU' | 'O', or 'san:<prefix>' to read a SAN
- * @param {object}  [opts.principals]  { [principalId]: { roles: [], permissions?, databases?: [] } }
- *                                     When present, this is an allow-list: unknown principals
- *                                     are refused even with a perfectly valid certificate.
+ * @param {string}  [opts.subjectField='CN']  'CN' | 'OU' | 'O', 'san:<prefix>' to read a SAN, or
+ *                                     'spiffe' to key principals by their full SPIFFE ID.
+ *                                     'spiffe' is the right choice for a new deployment: it is
+ *                                     the only one of these that names an identity nothing else
+ *                                     can collide with.
+ * @param {object}  [opts.principals]  { [principalId]: { roles: [], permissions?, databases?: [],
+ *                                     spiffeId? } } When present, this is an allow-list: unknown
+ *                                     principals are refused even with a perfectly valid
+ *                                     certificate. `spiffeId` pins the workload identity that
+ *                                     entry expects, independently of how the principal is keyed.
  * @param {string[]}[opts.defaultRoles] roles for a valid certificate not in `principals`
  * @param {function}[opts.resolve]     full override: (peer) => principal | null
  * @param {string[]}[opts.pinnedIssuers] accept only certificates whose issuer fingerprint is listed
+ * @param {string}  [opts.trustDomain] refuse SPIFFE IDs from any other trust domain
+ * @param {boolean} [opts.requireSpiffeId=false] refuse certificates that carry no SPIFFE ID at all
  */
 function createPrincipalResolver({
   subjectField = 'CN',
@@ -51,6 +60,8 @@ function createPrincipalResolver({
   resolve = null,
   pinnedIssuers = null,
   rolePermissions = ROLE_PERMISSIONS,
+  trustDomain = null,
+  requireSpiffeId = false,
 } = {}) {
   const registry = principals
     ? (principals instanceof Map ? principals : new Map(Object.entries(principals)))
@@ -76,7 +87,32 @@ function createPrincipalResolver({
       }
     }
 
-    const id = extractSubject(peer.certificate, subjectField);
+    // Read once, up front, so that both the trust-domain check and the identity that ends up on
+    // the principal come from the same parse. Reading it twice would let a certificate with two
+    // URI SANs pass one check on one of them and be recorded under the other.
+    let spiffeId = null;
+    try {
+      spiffeId = spiffe.fromCertificate(peer.certificate);
+    } catch (err) {
+      throw new GrpcError(GRPC_STATUS.PERMISSION_DENIED, err.message);
+    }
+
+    // Cross-domain admission is a federation decision, and federation that happens because
+    // nobody checked is not federation. A certificate from another trust domain is refused here
+    // even when it validates perfectly against a chained anchor.
+    if (trustDomain && spiffeId && spiffeId.trustDomain !== trustDomain) {
+      throw new GrpcError(GRPC_STATUS.PERMISSION_DENIED,
+        `'${spiffeId}' belongs to trust domain '${spiffeId.trustDomain}'; this server serves '${trustDomain}'`);
+    }
+    if (requireSpiffeId && !spiffeId) {
+      throw new GrpcError(GRPC_STATUS.UNAUTHENTICATED,
+        'this server requires a SPIFFE ID in the certificate\'s URI subjectAltName; the presented '
+        + 'certificate has none');
+    }
+
+    const id = subjectField === 'spiffe'
+      ? (spiffeId ? spiffeId.uri : null)
+      : extractSubject(peer.certificate, subjectField);
     if (!id) {
       throw new GrpcError(GRPC_STATUS.UNAUTHENTICATED, `the client certificate has no '${subjectField}' to identify it by`);
     }
@@ -88,9 +124,18 @@ function createPrincipalResolver({
         // has been decommissioned or revoked. The allow-list is the enforcement point.
         throw new GrpcError(GRPC_STATUS.PERMISSION_DENIED, `'${id}' is not an authorised principal on this server`);
       }
+      // An allow-list entry may pin the SPIFFE ID it expects. That turns the entry from "a
+      // certificate saying CN=idp-service" into "a certificate saying CN=idp-service AND
+      // carrying this exact workload identity", which is what stops a CN collision -- from a
+      // second CA, or from a service legitimately renamed -- becoming an impersonation.
+      if (entry.spiffeId && (!spiffeId || spiffeId.uri !== entry.spiffeId)) {
+        throw new GrpcError(GRPC_STATUS.PERMISSION_DENIED,
+          `'${id}' must present the SPIFFE ID ${entry.spiffeId}, got ${spiffeId ? spiffeId.uri : 'none'}`);
+      }
       const roles = entry.roles || [];
       return {
         id,
+        spiffeId: spiffeId ? spiffeId.uri : null,
         roles,
         permissions: permissionsFor(entry, roles),
         databases: entry.databases || null, // null = every database this principal's ACL allows
@@ -102,6 +147,7 @@ function createPrincipalResolver({
     const roles = defaultRoles || ['reader'];
     return {
       id,
+      spiffeId: spiffeId ? spiffeId.uri : null,
       roles,
       permissions: permissionsFor(null, roles),
       databases: null,
