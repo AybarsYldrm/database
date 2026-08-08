@@ -91,10 +91,24 @@ it.
   6. renew              over mTLS, well before expiry — no bootstrap credential involved
 ```
 
-That is RFC 7030 (EST) semantics carried over gRPC. In this stack the CA is central (the ACME
-authority at `trust.fitfak.net`), and **this server is a Registration Authority, never a CA**:
-it authenticates the bootstrapping peer and decides what identity it may hold, then delegates
-the signature. It holds no signing key.
+That is RFC 7030 (EST) semantics carried over gRPC. In this stack the CA is central (the identity
+provider at `trust.fitfak.net`), and **this server is a Registration Authority, never a CA**: it
+authenticates the bootstrapping peer and decides what identity it may hold, then delegates the
+signature. It holds no signing key.
+
+> **Before step 1 there is a step 0.** With `admission` configured, the server starts *sealed*:
+> it wears an ephemeral self-signed certificate generated at boot, and it serves nobody —
+> including the flow above — until the identity provider has handed it a server certificate, a
+> key, and the trust anchors it will validate clients against.
+>
+> The reason is that every service here takes its authority from the IdP, so a database reachable
+> before the IdP is up is a database answering authorisation questions nobody can yet ask — and
+> that gap is where a database grows a second identity system. A service that connects too early
+> gets `FAILED_PRECONDITION` with a message saying so.
+>
+> Nothing in this section changes for ordinary services. See **[docs/ZERO-TRUST.md](docs/ZERO-TRUST.md)**
+> for the state machine, the two-message handover, the threat model and the replay analysis, and
+> `examples/idp-bootstrap.js` for a runnable walk-through.
 
 ### Client side
 

@@ -343,6 +343,7 @@ class DatabaseServer extends EventEmitter {
             permissions: principal.permissions,
             securityLevel: call.peer.securityLevel,
             certificateFingerprint: principal.fingerprint || '',
+            spiffeId: principal.spiffeId || '',
           };
         },
       },
