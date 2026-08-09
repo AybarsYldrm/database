@@ -135,13 +135,21 @@ async function main() {
 
   console.log('\n2. Credential use is counted on the entry, so rotation resets it');
 
+  // The timestamp is taken ONCE and passed to both sides.
+  //
+  // It used to be `Date.now()` in the request and another `Date.now()` inside the proof
+  // helper. Object properties evaluate in order, so the two calls could straddle a millisecond
+  // boundary — and when they did, the transcripts differed by one digit and the HMAC did not
+  // verify. It passed locally every time and failed in CI, which is the signature of every
+  // flaky test: two reads of a clock that the author thought were one.
+  const enrolledAt = Date.now();
   const grant = await attestor.attest.call(null, {
     request: {
       serviceName: 'dns-resolver',
       nonce: 'n1',
-      timestamp: Date.now(),
+      timestamp: enrolledAt,
       csrPem: 'csr',
-      proof: proofFor(secret, 'dns-resolver', 'n1'),
+      proof: proofFor(secret, 'dns-resolver', 'n1', enrolledAt),
     },
     channelBinding: Buffer.from('cb'),
   }).catch(() => null);
@@ -335,10 +343,11 @@ function fakeDatabaseServer() {
   };
 }
 
-function proofFor(secretB64, serviceName, nonce) {
+/** `timestamp` is a required argument, not a default: see the note at the call site. */
+function proofFor(secretB64, serviceName, nonce, timestamp) {
   const { computeEnrolmentProof } = require('../src/provisioning/attestor');
   return computeEnrolmentProof(Buffer.from(secretB64, 'base64'), {
-    serviceName, nonce, timestamp: Date.now(), channelBinding: Buffer.from('cb'), csrPem: 'csr',
+    serviceName, nonce, timestamp, channelBinding: Buffer.from('cb'), csrPem: 'csr',
   }).toString('base64');
 }
 
