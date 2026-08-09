@@ -52,7 +52,7 @@ const CA_FINGERPRINT = process.env.FITFAK_DB_CA_FINGERPRINT || '';
 const ENROLMENT_SECRET = process.env.FITFAK_ENROLMENT_SECRET || '';
 // Once the IdP is up, this is the better path: the service presents a token it already holds
 // rather than a secret pasted into its environment. Same endpoint, different era — see the
-// composite attestor in examples/db-server.js.
+// composite attestor in bin/db-server.js.
 const ACCESS_TOKEN = process.env.FITFAK_ACCESS_TOKEN || '';
 
 // ---------------------------------------------------------------------------------------------

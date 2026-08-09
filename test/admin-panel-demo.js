@@ -266,8 +266,16 @@ async function main() {
   const wrongToken = await request(port, 'GET', '/api/overview', { token: 'wrong-token-aaaaaaaaaaaa' });
   check('a request with the wrong token is refused', wrongToken.status === 401);
 
+  // A person with a browser gets sent to sign in, not a 401 body. A 401 is what an API consumer
+  // needs and a dead end for someone who came here to look at the database.
   const panelNoToken = await request(port, 'GET', '/');
-  check('the panel itself is refused without a token', panelNoToken.status === 401);
+  check('the panel sends an unauthenticated browser to sign in',
+    panelNoToken.status === 302 && panelNoToken.headers.location === '/login');
+
+  const login = await request(port, 'GET', '/login');
+  check('the sign-in page renders', login.status === 200 && login.text.includes('<title>fitdb'));
+  check('and offers the break-glass token when there is no identity provider',
+    login.text.includes('var idpEnabled = false'));
 
   const panel = await request(port, 'GET', `/?token=${admin.token}`);
   check('the panel is served with one', panel.status === 200 && panel.text.includes('<title>fitdb'));

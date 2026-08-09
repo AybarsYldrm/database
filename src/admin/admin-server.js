@@ -11,6 +11,24 @@ const crypto = require('node:crypto');
 // service per loopback IP, port 80, fronted by whatever terminates TLS at the edge.
 //
 //
+// WHO GETS IN
+//
+// Two ways, and the difference between them is the point.
+//
+//   1. THE IDENTITY PROVIDER, which is the everyday path. The operator clicks through to the IdP,
+//      signs in there with whatever it requires that day, and comes back with an authorization
+//      code. The IdP decides who is an administrator; this panel only checks the answer. See
+//      src/admin/idp-auth.js.
+//
+//   2. THE STARTUP TOKEN, which is break-glass. It exists because the IdP is a separate process
+//      that can be down, and when it is down this database is the thing an operator most needs to
+//      look at. A panel that fails alongside the IdP is a panel unavailable during exactly the
+//      incident it would help with.
+//
+// The panel shows which of the two you used, because they are not equivalent and an operator
+// should never be unsure which one is holding the door open.
+//
+//
 // WHY THIS IS NOT AS ALARMING AS "PLAIN HTTP ADMIN PANEL" SOUNDS, AND WHERE IT STILL IS
 //
 // The bind address is the primary control. 127.0.2.1 is reachable only from this host, so the
@@ -18,16 +36,13 @@ const crypto = require('node:crypto');
 // who can run code on this machine can already read the database's memory, which is strictly
 // worse than anything the panel offers.
 //
-// That is a real boundary, but it is not the whole story, so there is a token as well:
+// That is a real boundary, but it is not the whole story, so credentials are required as well:
 //
 //   - a local process is not necessarily a TRUSTED local process. A build agent, a sidecar, a
 //     compromised dependency in some unrelated service on the same box — all of them can reach
 //     a loopback port.
 //   - a browser on this host can be steered to a loopback URL by any page the operator visits.
-//     The token stops a drive-by POST; the same-origin check stops the rest.
-//
-// The token is generated at startup and printed once. It is not a password: it is a bearer
-// credential for a process-lifetime session, and rotating it means restarting.
+//     The credential stops a drive-by POST; the same-origin check stops the rest.
 //
 // What this panel deliberately CANNOT do:
 //
@@ -39,8 +54,21 @@ const crypto = require('node:crypto');
 //     may ASK for one.
 
 const PANEL_FILE = path.join(__dirname, 'panel.html');
+const LOGIN_FILE = path.join(__dirname, 'login.html');
 
 const LOOPBACK = /^(127\.\d{1,3}\.\d{1,3}\.\d{1,3}|::1|localhost)$/;
+
+// The panel is a single-page app and its own entry point. Landing on the dashboard means landing
+// on `/` with a session already established — so the sign-in surface is a SEPARATE page rather
+// than a state of the panel. A panel that renders itself and then discovers it is unauthenticated
+// flashes real-looking empty tables at an operator, and an empty table and a forbidden table look
+// identical.
+const SECURITY_HEADERS = {
+  'cache-control': 'no-store',
+  'x-content-type-options': 'nosniff',
+  'x-frame-options': 'DENY',
+  'referrer-policy': 'no-referrer',
+};
 
 class AdminServer {
   /**
@@ -53,10 +81,11 @@ class AdminServer {
    * @param {string}  [opts.token]      generated when omitted
    * @param {boolean} [opts.allowNonLoopback=false]
    * @param {object}  [opts.info]       static facts for the overview (target address, trust domain…)
+   * @param {object}  [opts.idpAuth]    an IdpAuth; when absent the panel is token-only
    */
   constructor({
     server, metrics, registry, host = '127.0.2.1', port = 80,
-    token = null, allowNonLoopback = false, info = {}, logger = null,
+    token = null, allowNonLoopback = false, info = {}, logger = null, idpAuth = null,
   }) {
     if (!server) throw new Error('fitdb admin: a DatabaseServer is required');
     if (!metrics) throw new Error('fitdb admin: ServiceMetrics is required');
@@ -80,13 +109,15 @@ class AdminServer {
     this.port = port;
     this.info = info;
     this._log = logger;
+    this.idpAuth = idpAuth;
     this.token = token || crypto.randomBytes(24).toString('base64url');
     this.origin = `http://${host}${port === 80 ? '' : `:${port}`}`;
     this.http = null;
 
-    // Read once at startup rather than per request: it is a file this process ships with, and
-    // re-reading it on every load would turn a panel refresh into disk I/O on the database host.
+    // Read once at startup rather than per request: files this process ships with, and re-reading
+    // them on every load would turn a panel refresh into disk I/O on the database host.
     this._panel = fs.readFileSync(PANEL_FILE, 'utf8');
+    this._login = fs.readFileSync(LOGIN_FILE, 'utf8');
   }
 
   listen() {
@@ -113,28 +144,54 @@ class AdminServer {
     const url = new URL(req.url, this.origin);
     const pathname = url.pathname;
 
-    // The panel itself is served with the token in the query string, and immediately sets it as
-    // a cookie so it does not stay in the address bar — the same reasoning as the device-code
-    // link in the IdP: a URL ends up in history, in a screenshot, and over someone's shoulder.
+    // ---- sign-in surface --------------------------------------------------------------------
+    //
+    // These three run BEFORE the credential check, and have to: they are how a credential is
+    // obtained. Each one is safe to reach unauthenticated on its own — /login renders a button,
+    // /auth/start mints a state this process will require back, /auth/callback is useless without
+    // a state that matches one.
+    if (pathname === '/login' && req.method === 'GET') return this._serveLogin(req, res, url);
+    if (pathname === '/auth/start' && req.method === 'GET') return this._authStart(res);
+    if (pathname === '/auth/callback' && req.method === 'GET') return this._authCallback(res, url);
+
+    if (pathname === '/logout') {
+      const session = this._session(req);
+      if (session?.sid) this.idpAuth?.endSession(session.sid);
+      res.statusCode = 302;
+      res.setHeader('set-cookie', [expiredCookie('fitdb_sid'), expiredCookie('fitdb_admin')]);
+      res.setHeader('location', '/login?signed_out=1');
+      return res.end();
+    }
+
+    // ---- the panel --------------------------------------------------------------------------
+    //
+    // Landing here signed in means landing on the dashboard, which is the whole intent: an
+    // operator arriving from the IdP should see the state of the database, not a form.
     if (pathname === '/' && req.method === 'GET') {
+      // A token in the query string is accepted once and immediately moved into a cookie, so it
+      // does not stay in the address bar — the same reasoning as the device-code link in the IdP:
+      // a URL ends up in history, in a screenshot, and over someone's shoulder.
       const supplied = url.searchParams.get('token');
-      if (!this._tokenMatches(supplied)) return this._unauthorized(res);
-      res.statusCode = 200;
-      res.setHeader('content-type', 'text/html; charset=utf-8');
-      res.setHeader('cache-control', 'no-store');
-      res.setHeader('x-content-type-options', 'nosniff');
-      res.setHeader('x-frame-options', 'DENY');
-      res.setHeader('referrer-policy', 'no-referrer');
-      res.setHeader('set-cookie',
-        `fitdb_admin=${encodeURIComponent(this.token)}; Path=/; Max-Age=43200; HttpOnly; SameSite=Strict`);
-      return res.end(this._panel);
+      if (supplied && this._tokenMatches(supplied)) {
+        res.setHeader('set-cookie',
+          `fitdb_admin=${encodeURIComponent(this.token)}; Path=/; Max-Age=43200; HttpOnly; SameSite=Strict`);
+        return this._servePanel(res);
+      }
+      if (this._session(req)) return this._servePanel(res);
+
+      // No credential: to the sign-in page, not a 401. A 401 body is what an API consumer needs
+      // and a dead end for a person with a browser.
+      res.statusCode = 302;
+      res.setHeader('location', '/login');
+      return res.end();
     }
 
     if (!pathname.startsWith('/api/')) return send(res, 404, { error: 'not_found' });
 
-    if (!this._tokenMatches(this._suppliedToken(req, url))) return this._unauthorized(res);
+    const session = this._session(req);
+    if (!session) return this._unauthorized(res);
 
-    // Every state change is same-origin checked. The token alone is not enough: a page the
+    // Every state change is same-origin checked. The credential alone is not enough: a page the
     // operator visits could hold a stale token from a shared screenshot and fire a POST at
     // loopback. `Origin` is set by the browser and cannot be forged by page script.
     if (req.method === 'POST') {
@@ -145,17 +202,132 @@ class AdminServer {
     }
 
     const body = req.method === 'POST' ? await readJson(req) : {};
-    const result = await this._route(pathname, req.method, body, url);
+    const result = await this._route(pathname, req.method, body, url, session);
     if (result === undefined) return send(res, 404, { error: 'not_found' });
     return send(res, 200, result);
   }
 
-  _suppliedToken(req, url) {
+  // ---- authentication -------------------------------------------------------------------------
+
+  /**
+   * Who is making this request, by either path.
+   *
+   * The IdP session is checked first so that an operator who has signed in properly is reported as
+   * such even while a break-glass token cookie is still sitting in the same browser — the panel
+   * displays this, and displaying the weaker of two credentials would be misleading in the one
+   * direction that matters.
+   */
+  _session(req) {
+    const sid = cookieValue(req, 'fitdb_sid');
+    if (sid && this.idpAuth) {
+      const found = this.idpAuth.resolveSession(sid);
+      if (found) return { ...found, sid };
+    }
+    if (this._tokenMatches(this._suppliedToken(req))) {
+      return { via: 'token', username: 'break-glass token', role: null, sub: null };
+    }
+    return null;
+  }
+
+  _suppliedToken(req) {
     const header = req.headers['x-admin-token'];
     if (header) return String(header);
-    const cookie = /(?:^|;\s*)fitdb_admin=([^;]+)/.exec(req.headers.cookie || '');
-    if (cookie) return decodeURIComponent(cookie[1]);
-    return url.searchParams.get('token');
+    return cookieValue(req, 'fitdb_admin');
+  }
+
+  _servePanel(res) {
+    res.statusCode = 200;
+    res.setHeader('content-type', 'text/html; charset=utf-8');
+    for (const [name, value] of Object.entries(SECURITY_HEADERS)) res.setHeader(name, value);
+    return res.end(this._panel);
+  }
+
+  /**
+   * The sign-in page.
+   *
+   * Rendered by substitution rather than by a template engine: there are four values, all of them
+   * landing inside a <script> block, and all of them emitted as JSON literals. A template engine
+   * here would be a dependency whose only job is to make four replacements slower to audit.
+   *
+   * The one value that is not this process's own is `error`, which arrives in the query string —
+   * so anything that can send an operator to a URL can choose what that banner says. It cannot
+   * become script (see jsonForScript), but it can still lie, which is why the page keeps the
+   * issuer's hostname visible next to the button rather than only in the message.
+   */
+  _serveLogin(req, res, url) {
+    // Already signed in? Then this page has nothing to offer. Rendering it anyway is how an
+    // operator ends up signing in twice and wondering which session they are on.
+    if (this._session(req)) {
+      res.statusCode = 302;
+      res.setHeader('location', '/');
+      return res.end();
+    }
+    const html = this._login
+      .replace('{{IDP_ENABLED}}', this.idpAuth ? 'true' : 'false')
+      .replace('{{IDP_ISSUER}}', jsonForScript(this.idpAuth ? this.idpAuth.issuer : ''))
+      .replace('{{ERROR}}', jsonForScript(url.searchParams.get('error') || ''))
+      .replace('{{SIGNED_OUT}}', url.searchParams.get('signed_out') ? 'true' : 'false');
+
+    res.statusCode = 200;
+    res.setHeader('content-type', 'text/html; charset=utf-8');
+    for (const [name, value] of Object.entries(SECURITY_HEADERS)) res.setHeader(name, value);
+    return res.end(html);
+  }
+
+  _authStart(res) {
+    if (!this.idpAuth) {
+      res.statusCode = 302;
+      res.setHeader('location', '/login?error=' + encodeURIComponent(
+        'This database was started without identity-provider sign-in. Use the startup token.'));
+      return res.end();
+    }
+    try {
+      const { url } = this.idpAuth.beginAuthorization();
+      res.statusCode = 302;
+      res.setHeader('location', url);
+      return res.end();
+    } catch (err) {
+      res.statusCode = 302;
+      res.setHeader('location', `/login?error=${encodeURIComponent(err.message)}`);
+      return res.end();
+    }
+  }
+
+  async _authCallback(res, url) {
+    const redirect = (location, cookies = null) => {
+      res.statusCode = 302;
+      if (cookies) res.setHeader('set-cookie', cookies);
+      res.setHeader('location', location);
+      res.end();
+    };
+
+    if (!this.idpAuth) return redirect('/login?error=' + encodeURIComponent('sign-in is not configured'));
+
+    // The IdP reporting a failure is not this process's failure, and its description is the useful
+    // half. Passing it through beats replacing it with a generic message that sends the operator
+    // looking here instead of there.
+    const idpError = url.searchParams.get('error');
+    if (idpError) {
+      const detail = url.searchParams.get('error_description') || idpError;
+      return redirect(`/login?error=${encodeURIComponent(detail)}`);
+    }
+
+    try {
+      const { sid } = await this.idpAuth.completeAuthorization({
+        code: url.searchParams.get('code'),
+        state: url.searchParams.get('state'),
+      });
+      // HttpOnly so page script cannot read it, SameSite=Strict so no other origin can cause it to
+      // be sent. Not Secure, because this listener is plain HTTP on loopback and a Secure cookie
+      // would simply never be stored — a flag that silently disables the session is worse than its
+      // absence, which is at least visible here in a comment.
+      return redirect('/', [
+        `fitdb_sid=${encodeURIComponent(sid)}; Path=/; Max-Age=43200; HttpOnly; SameSite=Strict`,
+      ]);
+    } catch (err) {
+      this._log?.warn?.({ error: err.message, msg: 'admin sign-in failed' });
+      return redirect(`/login?error=${encodeURIComponent(err.message)}`);
+    }
   }
 
   _tokenMatches(supplied) {
@@ -170,18 +342,31 @@ class AdminServer {
   _unauthorized(res) {
     send(res, 401, {
       error: 'unauthorized',
-      error_description: 'An admin token is required. It is printed once when the database starts.',
+      error_description: this.idpAuth
+        ? 'Sign in through the identity provider at /login, or use the token printed when the database started.'
+        : 'An admin token is required. It is printed once when the database starts.',
+      loginUrl: '/login',
     });
   }
 
   // ---- routes -----------------------------------------------------------------------------
 
-  async _route(pathname, method, body, url) {
+  async _route(pathname, method, body, url, session) {
     const route = `${method} ${pathname}`;
 
     switch (route) {
       case 'GET /api/overview':
-        return this._overview();
+        return this._overview(session);
+
+      case 'GET /api/whoami':
+        return {
+          username: session.username,
+          subject: session.sub,
+          role: session.role,
+          via: session.via,
+          expiresAt: session.expiresAt || null,
+          idp: this.idpAuth ? this.idpAuth.status() : null,
+        };
 
       case 'GET /api/services':
         return { services: this._services() };
@@ -249,11 +434,17 @@ class AdminServer {
     }
   }
 
-  _overview() {
+  _overview(session = null) {
     const summary = this.metrics.summary();
     const gate = this.server.gate ? this.server.gate.status() : null;
     return {
       summary,
+      // Returned with the dashboard rather than fetched separately, because the panel needs it on
+      // its very first paint: which of the two credentials is holding the door open belongs in the
+      // header, not in a second round trip that might not have landed yet.
+      session: session && {
+        username: session.username, role: session.role, via: session.via, subject: session.sub,
+      },
       admission: gate && {
         state: gate.state,
         controlPrincipal: gate.controlPrincipal,
@@ -331,6 +522,33 @@ class AdminServer {
       metricsSampleIntervalMs: this.metrics.sampleIntervalMs,
     };
   }
+}
+
+function cookieValue(req, name) {
+  const match = new RegExp(`(?:^|;\\s*)${name}=([^;]+)`).exec(req.headers.cookie || '');
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
+function expiredCookie(name) {
+  return `${name}=; Path=/; Max-Age=0; HttpOnly; SameSite=Strict`;
+}
+
+/**
+ * A JSON literal safe to paste into a <script> block.
+ *
+ * JSON.stringify alone is not enough. Inside a script element the parser is still looking for
+ * `</script`, and it finds it inside string literals too — a value containing `</script><img
+ * onerror=…>` ends the block early and everything after it is markup. Escaping `<` removes the
+ * only character that can start that sequence; U+2028/9 are escaped because they terminate a line
+ * in JavaScript but not in JSON, which used to be a live syntax error in older engines.
+ */
+function jsonForScript(value) {
+  return JSON.stringify(String(value == null ? '' : value))
+    .replace(/</g, '\\u003c')
+    // The separators are matched by escape rather than written literally: a raw U+2028 in this
+    // file is invisible in every editor and survives exactly one careless copy-paste.
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029');
 }
 
 function send(res, status, payload) {

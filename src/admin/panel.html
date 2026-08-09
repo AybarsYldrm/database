@@ -93,6 +93,17 @@
   .gate-prov { background: #422006; color: #fbbf24; }
   .foot-note { font-size: 10.5px; color: #52525b; line-height: 1.45; }
 
+  /* Kim olarak girdiğiniz, mühür durumunun hemen üstünde ve her ekranda görünür.
+     İki farklı kimlik bilgisiyle girilebiliyor ve bunlar denk DEĞİL: hangisinin
+     kapıyı açık tuttuğundan emin olmamak, tam olarak istenmeyen durum. */
+  .who { border-top: 1px solid #1c1c1f; margin-top: 12px; padding-top: 12px; }
+  .who-name { font-size: 12px; color: #e4e4e7; font-weight: 600; overflow-wrap: anywhere; }
+  .who-via { font-size: 10.5px; margin-top: 3px; }
+  .who-idp { color: #4ade80; }
+  .who-token { color: #fbbf24; }
+  .who-out { display: inline-block; margin-top: 8px; font-size: 11px; color: #a1a1aa; text-decoration: none; border: 1px solid #27272a; border-radius: 5px; padding: 4px 9px; }
+  .who-out:hover { color: #fff; border-color: #3f3f46; }
+
   main { padding: 32px 40px 64px; max-width: 1180px; }
   .page-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 20px; margin-bottom: 26px; padding-bottom: 18px; border-bottom: 1px solid var(--line); }
   h1 { font-size: 21px; font-weight: 600; margin: 0 0 4px; letter-spacing: -0.02em; }
@@ -197,6 +208,11 @@
   <div class="sidebar-foot">
     <div class="gate-pill gate-sealed" id="gate-pill">—</div>
     <div class="foot-note" id="foot-note">Bu panel yalnızca yerel adresten erişilebilir.</div>
+    <div class="who" id="who" style="display:none">
+      <div class="who-name" id="who-name">—</div>
+      <div class="who-via" id="who-via">—</div>
+      <a class="who-out" href="/logout">Çıkış</a>
+    </div>
   </div>
 </aside>
 
@@ -465,6 +481,24 @@
     else { pill.className = 'gate-pill gate-sealed'; pill.textContent = 'MÜHÜRLÜ'; }
 
     $('foot-note').textContent = o.info.adminOrigin + ' · yalnızca yerel';
+
+    // Oturum, panelin İLK boyamasında gerekli olduğu için genel bakışla birlikte geliyor; ayrı bir
+    // istek olsaydı, henüz dönmemişken kimin olarak bakıldığı belirsiz kalırdı.
+    if (o.session) {
+      $('who').style.display = '';
+      $('who-name').textContent = o.session.username || o.session.subject || '—';
+      var via = $('who-via');
+      if (o.session.via === 'idp') {
+        via.className = 'who-via who-idp';
+        via.textContent = 'kimlik sağlayıcısı' + (o.session.role ? ' · ' + o.session.role : '');
+      } else {
+        via.className = 'who-via who-token';
+        // Açılış anahtarı bir parola değil: sahibi yok, süresi takip edilmiyor ve yalnızca kimlik
+        // sağlayıcısının çalışmadığı durum için var. Bunu söylememek, geçici bir yolun kalıcı
+        // hâle gelmesinin en yaygın sebebidir.
+        via.textContent = 'açılış anahtarı · geçici yol';
+      }
+    }
 
     $('overview-stats').innerHTML =
       card('Taşınan veri', mb(s.totalMegabytes) + ' MB', 'sıfırlamadan bu yana ' + fmtDur(s.sinceResetMs)) +
