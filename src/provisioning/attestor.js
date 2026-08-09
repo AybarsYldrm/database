@@ -93,9 +93,12 @@ function createSharedSecretAttestor({
   onConsumed = null,
 } = {}) {
   if (!enrolments) throw new Error('fitdb enrol: createSharedSecretAttestor requires an `enrolments` map');
+  // A Map is kept by reference rather than copied, so a caller holding one can add, remove or
+  // re-key a service while the server is running and have it take effect on the next enrolment.
+  // That is what lets an admin panel register a new service without a restart -- and a restart
+  // to add a service is exactly the pressure that makes operators raise `maxUses` instead.
   const registry = enrolments instanceof Map ? enrolments : new Map(Object.entries(enrolments));
   const usedNonces = new Map(); // nonce -> expiry, pruned lazily
-  const useCounts = new Map();  // serviceName -> uses so far
 
   return {
     name: 'shared-secret',
@@ -126,7 +129,14 @@ function createSharedSecretAttestor({
       usedNonces.set(nonce, Date.now() + clockSkewMs * 2);
 
       const maxUses = entry.maxUses ?? 1;
-      const used = useCounts.get(serviceName) || 0;
+      // The count lives ON THE ENTRY, not in a map beside it.
+      //
+      // With a separate map keyed by service name, rotating a secret would leave the old
+      // count in place: the operator issues a fresh credential, hands it over, and it is
+      // refused as "already used" by a counter that belongs to the credential it replaced.
+      // Keeping the count with the entry means replacing the entry replaces its history too,
+      // which is what rotation means.
+      const used = entry.uses || 0;
       // A bootstrap secret that stays valid forever is a permanent backdoor into the identity
       // system; the default of one use makes it a genuinely single-shot credential, and
       // renewal goes through the mTLS re-enrolment path instead.
@@ -145,9 +155,8 @@ function createSharedSecretAttestor({
         // asking for the wrong name, a CA that happens to be unreachable -- permanently burns
         // the credential, which turns a recoverable mistake into a re-provisioning job.
         commit: () => {
-          const now = useCounts.get(serviceName) || 0;
-          useCounts.set(serviceName, now + 1);
-          if (onConsumed) onConsumed({ serviceName, uses: now + 1, maxUses });
+          entry.uses = (entry.uses || 0) + 1;
+          if (onConsumed) onConsumed({ serviceName, uses: entry.uses, maxUses });
         },
       };
     },

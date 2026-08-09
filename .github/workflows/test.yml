@@ -22,6 +22,16 @@ jobs:
           node-version: ${{ matrix.node }}
       - run: npm run test:engine
 
+      # The identity rules belong in THIS job, not the transport one below, and the reason is
+      # the same reason the transport job exists: a check that only runs when an optional
+      # package happens to be linkable is a check that stops running the first time it is not.
+      #
+      # None of these need the transport. The SPIFFE grammar, the admission state machine and
+      # the CA vault are deliberately free of it -- the last escalation found in this codebase
+      # was an authorisation comparison that silently stopped running, and it survived a green
+      # build because the only suite covering it could not load.
+      - run: npm run test:zero-trust
+
   transport:
     # The gRPC layer depends on @fitfak/grpc. Until that is published, CI checks out the
     # sibling repository and links it, which also means this job fails loudly if the two
