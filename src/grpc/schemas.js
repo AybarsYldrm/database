@@ -240,6 +240,13 @@ const DATABASE_SCHEMAS = {
     { no: 3, name: 'permissions', type: 'int32' },
     { no: 4, name: 'securityLevel', type: 'string' },
     { no: 5, name: 'certificateFingerprint', type: 'string' },
+    // The workload identity the server actually authenticated, echoed back.
+    //
+    // Worth carrying separately from `principal`: a deployment keyed by CN has a principal that
+    // is a bare name and a SPIFFE ID that is the verifiable identity, and a caller checking
+    // "am I who I think I am" needs to see the second one. Empty when the certificate carries
+    // no SPIFFE ID, which is legal for the CN-keyed deployments that predate it.
+    { no: 6, name: 'spiffeId', type: 'string' },
   ],
 };
 

@@ -30,7 +30,21 @@ const crypto = require('node:crypto');
  * is missing -- is a clear message at configuration time rather than a module-not-found
  * during someone's first enrolment.
  */
-function createFitfakSslCaBackend({ ca, ssl = null, defaultValidityDays = 397 } = {}) {
+/**
+ * How far to backdate notBefore.
+ *
+ * A certificate that becomes valid at exactly the instant it is issued is rejected by any
+ * verifier whose clock is a second behind the issuer's, and clocks in a fleet are always a
+ * second behind something. For a 397-day certificate nobody notices; for a five-minute one this
+ * is the difference between "works" and "fails on about a third of the fleet, intermittently".
+ * Sixty seconds is what Let's Encrypt and SPIRE both use, and it costs one minute of a lifetime
+ * that is already deliberately short.
+ */
+const DEFAULT_BACKDATE_SECONDS = 60;
+
+function createFitfakSslCaBackend({
+  ca, ssl = null, defaultValidityDays = 397, backdateSeconds = DEFAULT_BACKDATE_SECONDS,
+} = {}) {
   const lib = ssl || requireOptional('@fitfak/ssl',
     'the @fitfak/ssl CA backend needs the @fitfak/ssl package installed, or an `ssl` module passed in');
   if (!ca) throw new Error('fitdb pki: createFitfakSslCaBackend requires a `ca` (a @fitfak/ssl CertificateAuthority)');
@@ -53,30 +67,19 @@ function createFitfakSslCaBackend({ ca, ssl = null, defaultValidityDays = 397 } 
       return { chainPem, fingerprints: chainPem.map(fingerprintOf) };
     },
 
-    async parseCsr(csrPem) {
-      const parsed = lib.parseCSR(csrPem);
-      const subject = subjectFromPairs(parsed.subject, lib);
-      // A CSR carrying two CN attributes would let the first one satisfy an RA's
-      // equality check while a relying party reads the second. `subjectAttrs`
-      // preserves DER order and every occurrence, so the count is checkable.
-      const commonNames = (parsed.subjectAttrs || [])
-        .filter(([oidHex]) => oidHex === '550403')
-        .map(([, value]) => value);
-      return {
-        subject,
-        subjectAttrs: parsed.subjectAttrs || null,
-        commonNames,
-        altNames: (parsed.sans || parsed.altNames || []).map((s) => (typeof s === 'string' ? s : s.value)),
-        publicKeyPem: parsed.publicKeyPem || null,
-        // A CSR is self-signed by the key being certified; verifying that signature is the
-        // proof-of-possession step. Skipping it would let a caller request a certificate over
-        // someone else's public key.
-        verified: lib.verifyCSR(parsed) === true,
-        raw: parsed,
-      };
-    },
+    parseCsr: createSslCsrParser(lib),
 
-    async issue({ csrPem, subject, validityDays = defaultValidityDays }) {
+    async issue({ csrPem, subject, validityDays = defaultValidityDays, validitySeconds = null }) {
+      // Short-lived issuance goes through explicit notBefore/notAfter rather than a day count,
+      // because a day count cannot express five minutes and rounding it up to one day would
+      // quietly undo the entire reason the caller asked for five minutes.
+      const validity = validitySeconds
+        ? (() => {
+          const notBefore = new Date(Date.now() - backdateSeconds * 1000);
+          return { notBefore, notAfter: new Date(Date.now() + validitySeconds * 1000) };
+        })()
+        : { validityDays };
+
       // The subject is taken from the GRANT, never from the CSR.
       //
       // By default @fitfak/ssl copies the CSR's own subject into the certificate, which is
@@ -87,11 +90,12 @@ function createFitfakSslCaBackend({ ca, ssl = null, defaultValidityDays = 397 } 
       // being skipped -- and it was skipped, silently, for exactly as long as parseCSR
       // returned no decoded subject at all.
       const issued = lib.issueCertificateFromCSR(csrPem, ca.issuer || ca, {
-        validityDays,
+        ...validity,
         ...(subject && Object.keys(subject).length ? { subjectOverride: subject } : {}),
         // The CSR's SANs are kept rather than replaced by the grant's: enrolment has already
-        // checked they are a subset of what was granted, and issuing the full granted set to
-        // a peer that asked for less would widen the certificate beyond the request.
+        // checked they are a subset of what was granted -- including the SPIFFE URI, which it
+        // requires to be present and to match exactly -- and issuing the full granted set to a
+        // peer that asked for less would widen the certificate beyond the request.
       });
       const certPem = issued.pem || issued.certPem;
       return {
@@ -174,6 +178,39 @@ function createCustomCaBackend({ name = 'custom', getTrustAnchors, parseCsr, iss
 
 // ---- helpers ---------------------------------------------------------------------------------
 
+/**
+ * Turns @fitfak/ssl's `parseCSR` into the shape the enrolment service checks grants against.
+ *
+ * Shared by every backend that has @fitfak/ssl available, including the one that delegates
+ * signing to the identity provider: the CSR still has to be decoded HERE, because the identity
+ * check it feeds is made here. Sending the request away to be parsed would put the decision and
+ * the evidence for it on opposite sides of a network hop.
+ */
+function createSslCsrParser(lib) {
+  return async function parseCsr(csrPem) {
+    const parsed = lib.parseCSR(csrPem);
+    const subject = subjectFromPairs(parsed.subject, lib);
+    // A CSR carrying two CN attributes would let the first one satisfy an RA's equality check
+    // while a relying party reads the second. `subjectAttrs` preserves DER order and every
+    // occurrence, so the count is checkable.
+    const commonNames = (parsed.subjectAttrs || [])
+      .filter(([oidHex]) => oidHex === '550403')
+      .map(([, value]) => value);
+    return {
+      subject,
+      subjectAttrs: parsed.subjectAttrs || null,
+      commonNames,
+      altNames: (parsed.sans || parsed.altNames || []).map((s) => (typeof s === 'string' ? s : s.value)),
+      publicKeyPem: parsed.publicKeyPem || null,
+      // A CSR is self-signed by the key being certified; verifying that signature is the
+      // proof-of-possession step. Skipping it would let a caller request a certificate over
+      // someone else's public key.
+      verified: lib.verifyCSR(parsed) === true,
+      raw: parsed,
+    };
+  };
+}
+
 function requireOptional(moduleName, message) {
   try { return require(moduleName); }
   catch (err) { throw new Error(`fitdb pki: ${message} (${err.message})`); }
@@ -217,6 +254,8 @@ module.exports = {
   createFitfakSslCaBackend,
   createAcmeCaBackend,
   createCustomCaBackend,
+  createSslCsrParser,
   splitPemChain,
   fingerprintOf,
+  DEFAULT_BACKDATE_SECONDS,
 };

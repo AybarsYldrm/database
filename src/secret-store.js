@@ -77,13 +77,28 @@ class SecretStore {
     this.secrets = database.collection(collection);
   }
 
+  /**
+   * The embedded engine exposes `defineCollectionAsync`; the gRPC client's RemoteDatabase
+   * exposes `defineCollection`. Accepting either is what lets the identity provider -- which
+   * reaches this database over the wire -- keep its certificate authority in the same encrypted
+   * store as everything else. Without it the store would only work for processes that happen to
+   * hold the database on local disk, which is the one deployment shape this stack does not use.
+   */
   static async defineCollection(database, { collection = 'secrets', ...opts } = {}) {
-    return database.defineCollectionAsync(collection, {
+    const definition = {
       title: 'Secrets',
       description: 'Certificates, keys and other secret material, versioned',
       fields: SECRETS_SCHEMA_FIELDS,
       ...opts,
-    });
+    };
+    if (typeof database.defineCollectionAsync === 'function') {
+      return database.defineCollectionAsync(collection, definition);
+    }
+    if (typeof database.defineCollection === 'function') {
+      return database.defineCollection(collection, definition);
+    }
+    throw new Error('fitdb secrets: this database handle exposes neither defineCollectionAsync nor '
+      + 'defineCollection, so the secrets collection cannot be created');
   }
 
   static async open(database, options = {}) {
@@ -298,7 +313,7 @@ class SecretStore {
    * the DNS cache: one subscription, no polling.
    */
   watch(handler) {
-    return this.database.watch(this.collectionName, (event) => {
+    const decorate = (event) => {
       if (event.op !== 'put' || !event.record) return handler(event);
       return handler({
         ...event,
@@ -309,7 +324,17 @@ class SecretStore {
           version: event.record.version,
         },
       });
-    });
+    };
+
+    // Same split as defineCollection above: the embedded Database watches by collection name,
+    // the remote handle watches through the collection object.
+    if (typeof this.database.watch === 'function') {
+      return this.database.watch(this.collectionName, decorate);
+    }
+    const watched = this.secrets.watch();
+    watched.on('put', decorate);
+    watched.on('delete', decorate);
+    return watched;
   }
 }
 
