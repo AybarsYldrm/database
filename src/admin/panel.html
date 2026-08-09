@@ -1,0 +1,846 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>fitdb — yönetim</title>
+<!-- Tasarım paketi BURAYA GÖMÜLÜ, session.fitfak.net'ten çekilmiyor.
+     Kimlik sağlayıcısının paneli onu dışarıdan yükleyebilir; veritabanınınki
+     yükleyemez, çünkü bu panele bakma sebebiniz büyük ihtimalle kimlik
+     sağlayıcısının ayakta OLMAMASI. Stil için ona bağlanmak, aracı tam da
+     ihtiyaç duyulduğu anda kullanılamaz kılardı. Aynı gerekçeyle harici font
+     yok: bu panel ağ erişimi olmayan bir makinede de açılmalı. -->
+<style>
+  :root {
+    --fk-font: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+    --fk-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;
+
+    --fk-bg: #ffffff;
+    --fk-surface: #ffffff;
+    --fk-surface-2: #f4f4f5;
+    --fk-text: #18181b;
+    --fk-text-muted: #52525b;
+    --fk-text-subtle: #a1a1aa;
+    --fk-border: #e4e4e7;
+    --fk-border-strong: #d4d4d8;
+    --fk-success: #15803d;  --fk-success-bg: #f0fdf4;
+    --fk-warning: #a16207;  --fk-warning-bg: #fefce8;
+    --fk-danger:  #b91c1c;  --fk-danger-bg:  #fef2f2;
+    --fk-accent:  #1d4ed8;  --fk-accent-bg:  #eff6ff;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fk-bg: #09090b;
+      --fk-surface: #0f0f11;
+      --fk-surface-2: #1c1c1f;
+      --fk-text: #fafafa;
+      --fk-text-muted: #a1a1aa;
+      --fk-text-subtle: #71717a;
+      --fk-border: #27272a;
+      --fk-border-strong: #3f3f46;
+      --fk-success: #4ade80;  --fk-success-bg: #052e16;
+      --fk-warning: #fbbf24;  --fk-warning-bg: #422006;
+      --fk-danger:  #f87171;  --fk-danger-bg:  #450a0a;
+      --fk-accent:  #93c5fd;  --fk-accent-bg:  #172554;
+    }
+  }
+
+  /* Kenar çubuğu KASITLI olarak her iki temada da koyu: yönetim yüzeyi,
+     uygulamanın geri kalanından bakışta ayırt edilebilmeli. */
+  :root {
+    --ink-contrast: var(--fk-bg);
+    --bg: var(--fk-surface);
+    --bg-sidebar: #0a0a0a;
+    --bg-subtle: var(--fk-bg);
+    --bg-hover: var(--fk-surface-2);
+    --ink: var(--fk-text);
+    --ink-2: var(--fk-text-muted);
+    --ink-3: var(--fk-text-subtle);
+    --line: var(--fk-border);
+    --line-strong: var(--fk-border-strong);
+    --sidebar-ink: #a1a1aa;
+    --sidebar-ink-active: #ffffff;
+    --sidebar-hover: #1c1c1f;
+    --ok: var(--fk-success);   --ok-bg: var(--fk-success-bg);
+    --warn: var(--fk-warning); --warn-bg: var(--fk-warning-bg);
+    --bad: var(--fk-danger);   --bad-bg: var(--fk-danger-bg);
+    --acc: var(--fk-accent);   --acc-bg: var(--fk-accent-bg);
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font-family: var(--fk-font); font-size: 14px; line-height: 1.5;
+    display: grid; grid-template-columns: 240px 1fr; min-height: 100vh;
+  }
+  .mono { font-family: var(--fk-mono); }
+  button, input, select, textarea { font: inherit; color: inherit; }
+  button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+
+  aside { background: var(--bg-sidebar); color: var(--sidebar-ink); padding: 20px 0; position: sticky; top: 0; height: 100vh; overflow-y: auto; display: flex; flex-direction: column; }
+  .brand { padding: 0 20px 6px; font-weight: 700; font-size: 15px; color: #fff; letter-spacing: -0.01em; }
+  .brand span { color: var(--ink-3); font-weight: 400; }
+  .brand-sub { padding: 0 20px 22px; font-size: 11px; color: #52525b; font-family: var(--fk-mono); }
+  .nav-group { margin-bottom: 20px; }
+  .nav-label { padding: 0 20px 6px; font-size: 10px; text-transform: uppercase; letter-spacing: 0.09em; color: #52525b; font-weight: 600; }
+  .nav-item { display: block; width: 100%; text-align: left; background: none; border: none; color: var(--sidebar-ink); padding: 9px 20px; cursor: pointer; font-size: 13.5px; border-left: 2px solid transparent; }
+  .nav-item:hover { background: var(--sidebar-hover); color: #fff; }
+  .nav-item.active { background: var(--sidebar-hover); color: var(--sidebar-ink-active); border-left-color: #fff; font-weight: 600; }
+
+  .sidebar-foot { margin-top: auto; padding: 16px 20px 20px; border-top: 1px solid #1c1c1f; }
+  .gate-pill { display: block; text-align: center; padding: 8px 0; border-radius: 5px; font-size: 12px; font-weight: 600; margin-bottom: 10px; }
+  .gate-open { background: #052e16; color: #4ade80; }
+  .gate-sealed { background: #450a0a; color: #f87171; }
+  .gate-prov { background: #422006; color: #fbbf24; }
+  .foot-note { font-size: 10.5px; color: #52525b; line-height: 1.45; }
+
+  main { padding: 32px 40px 64px; max-width: 1180px; }
+  .page-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 20px; margin-bottom: 26px; padding-bottom: 18px; border-bottom: 1px solid var(--line); }
+  h1 { font-size: 21px; font-weight: 600; margin: 0 0 4px; letter-spacing: -0.02em; }
+  .page-sub { color: var(--ink-2); font-size: 13px; margin: 0; max-width: 70ch; }
+  .view { display: none; }
+  .view.active { display: block; }
+
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 30px; }
+  .stat { border: 1px solid var(--line); border-radius: 6px; padding: 15px 17px; }
+  .stat-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--ink-3); font-weight: 600; margin-bottom: 7px; }
+  .stat-value { font-size: 25px; font-weight: 600; letter-spacing: -0.02em; line-height: 1; }
+  .stat-value.sm { font-size: 14px; padding-top: 8px; font-family: var(--fk-mono); }
+  .stat-note { font-size: 11.5px; color: var(--ink-2); margin-top: 6px; }
+
+  .table-wrap { border: 1px solid var(--line); border-radius: 6px; overflow: hidden; margin-bottom: 26px; }
+  .table-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; padding: 12px 16px; background: var(--bg-subtle); border-bottom: 1px solid var(--line); }
+  .table-head h2 { font-size: 13px; font-weight: 600; margin: 0; }
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; padding: 9px 16px; font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--ink-3); font-weight: 600; border-bottom: 1px solid var(--line); background: var(--fk-surface); }
+  td { padding: 11px 16px; border-bottom: 1px solid var(--line); vertical-align: middle; font-size: 13px; }
+  tr:last-child td { border-bottom: none; }
+  tbody tr:hover { background: var(--bg-subtle); }
+  .empty { padding: 30px 16px; text-align: center; color: var(--ink-3); font-size: 13px; }
+  .cell-strong { font-weight: 500; }
+  .cell-sub { font-size: 11.5px; color: var(--ink-3); margin-top: 2px; word-break: break-all; }
+  .num { font-family: var(--fk-mono); text-align: right; }
+
+  .badge { display: inline-block; font-size: 10.5px; font-weight: 600; padding: 2.5px 7px; border-radius: 3px; letter-spacing: 0.02em; border: 1px solid transparent; }
+  .badge-ok { background: var(--ok-bg); color: var(--ok); }
+  .badge-warn { background: var(--warn-bg); color: var(--warn); }
+  .badge-bad { background: var(--bad-bg); color: var(--bad); }
+  .badge-acc { background: var(--acc-bg); color: var(--acc); }
+  .badge-neutral { background: var(--bg-hover); color: var(--ink-2); border-color: var(--line-strong); }
+  .badge-dark { background: var(--ink); color: var(--ink-contrast); }
+
+  .btn { border: 1px solid var(--line-strong); background: var(--fk-surface); color: var(--ink); padding: 6px 12px; border-radius: 5px; cursor: pointer; font-size: 12.5px; font-weight: 500; }
+  .btn:hover { background: var(--bg-hover); border-color: var(--ink-3); }
+  .btn:disabled { opacity: .5; cursor: default; }
+  .btn-primary { background: var(--ink); color: var(--ink-contrast); border-color: var(--ink); }
+  .btn-danger { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 35%, transparent); }
+  .btn-danger:hover { background: var(--bad-bg); border-color: var(--bad); }
+  .btn-sm { padding: 4px 9px; font-size: 11.5px; }
+  .btn-row { display: flex; gap: 6px; flex-wrap: wrap; }
+
+  .modal-backdrop { display: none; position: fixed; inset: 0; background: rgba(10,10,10,0.55); z-index: 50; align-items: center; justify-content: center; padding: 20px; }
+  .modal-backdrop.open { display: flex; }
+  .modal { background: var(--fk-surface); border-radius: 8px; width: 100%; max-width: 520px; max-height: 88vh; overflow-y: auto; box-shadow: 0 20px 50px rgba(0,0,0,0.35); }
+  .modal-head { padding: 18px 22px; border-bottom: 1px solid var(--line); font-weight: 600; font-size: 15px; }
+  .modal-body { padding: 22px; }
+  .modal-foot { padding: 14px 22px; border-top: 1px solid var(--line); display: flex; justify-content: flex-end; gap: 8px; background: var(--bg-subtle); }
+  label { display: block; font-size: 11.5px; font-weight: 600; color: var(--ink-2); margin: 15px 0 5px; text-transform: uppercase; letter-spacing: 0.04em; }
+  label:first-child { margin-top: 0; }
+  input[type=text], input[type=number], select, textarea { width: 100%; padding: 8px 10px; border: 1px solid var(--line-strong); border-radius: 5px; font-size: 13px; background: var(--fk-bg); }
+  input:focus, select:focus, textarea:focus { border-color: var(--ink); }
+  textarea { min-height: 66px; resize: vertical; font-family: var(--fk-mono); font-size: 12px; }
+  .field-hint { font-size: 11.5px; color: var(--ink-3); margin-top: 5px; }
+  .check-row { display: flex; align-items: center; gap: 8px; padding: 6px 0; }
+  .check-row input { width: auto; }
+  .check-row label { margin: 0; text-transform: none; letter-spacing: 0; font-size: 13px; font-weight: 400; color: var(--ink); }
+
+  .banner { padding: 11px 14px; border-radius: 5px; font-size: 13px; margin-bottom: 18px; display: none; }
+  .banner.show { display: block; }
+  .banner-err { background: var(--bad-bg); color: var(--bad); }
+  .banner-ok { background: var(--ok-bg); color: var(--ok); }
+  .notice { border: 1px solid var(--line); border-left: 3px solid var(--acc); background: var(--bg-subtle); padding: 12px 15px; border-radius: 5px; font-size: 12.5px; color: var(--ink-2); margin-bottom: 22px; line-height: 1.55; }
+  .notice strong { color: var(--ink); }
+
+  .secret-reveal { background: var(--ink); color: var(--ink-contrast); padding: 12px 14px; border-radius: 5px; word-break: break-all; margin: 12px 0; font-size: 12.5px; font-family: var(--fk-mono); }
+  .secret-reveal .label { display: block; font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--ink-3); margin-bottom: 5px; font-family: var(--fk-font); }
+  .chip { display: inline-block; background: var(--bg-hover); border: 1px solid var(--line-strong); padding: 2px 7px; border-radius: 3px; font-size: 11px; margin: 1px 3px 1px 0; font-family: var(--fk-mono); }
+  .filter-bar { display: flex; gap: 8px; margin-bottom: 14px; align-items: center; }
+  .filter-bar input { max-width: 280px; }
+  .bar { height: 5px; background: var(--bg-hover); border-radius: 3px; overflow: hidden; margin-top: 5px; }
+  .bar > i { display: block; height: 100%; background: var(--acc); }
+</style>
+</head>
+<body>
+
+<aside>
+  <div class="brand">fitdb <span>yönetim</span></div>
+  <div class="brand-sub" id="brand-target">—</div>
+
+  <div class="nav-group">
+    <div class="nav-label">Genel</div>
+    <button class="nav-item active" data-view="overview">Genel bakış</button>
+    <button class="nav-item" data-view="connections">Bağlantılar</button>
+  </div>
+  <div class="nav-group">
+    <div class="nav-label">Uygulamalar</div>
+    <button class="nav-item" data-view="services">Servisler</button>
+  </div>
+  <div class="nav-group">
+    <div class="nav-label">Depolama</div>
+    <button class="nav-item" data-view="databases">Veritabanları</button>
+  </div>
+  <div class="nav-group">
+    <div class="nav-label">Güvenlik</div>
+    <button class="nav-item" data-view="admission">Kabul (mühür)</button>
+    <button class="nav-item" data-view="settings">Ayarlar</button>
+  </div>
+
+  <div class="sidebar-foot">
+    <div class="gate-pill gate-sealed" id="gate-pill">—</div>
+    <div class="foot-note" id="foot-note">Bu panel yalnızca yerel adresten erişilebilir.</div>
+  </div>
+</aside>
+
+<main>
+  <div class="banner banner-err" id="err"></div>
+  <div class="banner banner-ok" id="ok"></div>
+
+  <!-- ================= GENEL BAKIŞ ================= -->
+  <section class="view active" id="view-overview">
+    <div class="page-head">
+      <div>
+        <h1>Genel bakış</h1>
+        <p class="page-sub">Bu veritabanı süreci: kim bağlı, ne kadar taşındı, ve kapı açık mı.</p>
+      </div>
+      <div class="btn-row">
+        <button class="btn" id="btn-refresh">Yenile</button>
+        <button class="btn btn-danger" id="btn-reset-all">Sayaçları sıfırla</button>
+      </div>
+    </div>
+    <div class="stats" id="overview-stats"></div>
+
+    <div class="table-wrap">
+      <div class="table-head"><h2>Servis kullanımı</h2><span class="badge badge-neutral" id="overview-service-count">0</span></div>
+      <table>
+        <thead><tr><th>Servis</th><th>Durum</th><th class="num">MB</th><th class="num">İstek</th><th class="num">Canlı</th><th>Son görülme</th></tr></thead>
+        <tbody id="overview-services"><tr><td colspan="6" class="empty">yükleniyor…</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ================= BAĞLANTILAR ================= -->
+  <section class="view" id="view-connections">
+    <div class="page-head">
+      <div>
+        <h1>Bağlantılar</h1>
+        <p class="page-sub">Şu anda açık olan oturumlar. Sertifika sunmayan bir bağlantı hata değildir:
+          denetim düzlemi ve kayıt uçları sertifikasız erişilebilir olmak zorunda.</p>
+      </div>
+      <button class="btn" id="btn-refresh-conn">Yenile</button>
+    </div>
+    <div class="stats" id="conn-stats"></div>
+    <div class="table-wrap">
+      <div class="table-head"><h2>Açık bağlantılar</h2><span class="badge badge-neutral" id="conn-count">0</span></div>
+      <table>
+        <thead><tr><th>Asıl kimlik</th><th>Adres</th><th>Açılış</th><th class="num">İstek</th><th class="num">MB</th></tr></thead>
+        <tbody id="conn-body"><tr><td colspan="5" class="empty">yükleniyor…</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ================= SERVİSLER ================= -->
+  <section class="view" id="view-services">
+    <div class="page-head">
+      <div>
+        <h1>Servisler</h1>
+        <p class="page-sub">Bu veritabanına bağlanabilecek uygulamalar. Bir servis kaydetmek ona bir
+          kayıt sırrı verir; o sırla bir kez sertifika alır, sonrasında yenilemeyi mTLS üzerinden yapar.</p>
+      </div>
+      <button class="btn btn-primary" id="btn-new-service">Uygulama kaydet</button>
+    </div>
+
+    <div class="notice">
+      <strong>Kayıt sırrı tek kullanımlıktır.</strong> Servis ilk sertifikasını aldıktan sonra o sır
+      hiçbir şeyi açmaz; yenileme mTLS üzerinden yapılır ve sırra bir daha dokunmaz. Bu yüzden
+      <code>maxUses</code> değerini yükseltmek yerine, gerekiyorsa sırrı döndürün — kalıcı bir kayıt
+      sırrı, kimlik sisteminin yanında duran kalıcı bir arka kapıdır.
+    </div>
+
+    <div class="filter-bar"><input type="text" id="service-filter" placeholder="Servis adı ara…"></div>
+    <div class="table-wrap">
+      <div class="table-head"><h2>Kayıtlı servisler</h2><span class="badge badge-neutral" id="service-count">0</span></div>
+      <table>
+        <thead><tr><th>Servis</th><th>Roller</th><th>Kayıt sırrı</th><th class="num">MB</th><th></th></tr></thead>
+        <tbody id="services-body"><tr><td colspan="5" class="empty">yükleniyor…</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ================= VERİTABANLARI ================= -->
+  <section class="view" id="view-databases">
+    <div class="page-head">
+      <div>
+        <h1>Veritabanları</h1>
+        <p class="page-sub">Diskte kapladıkları yer. Bu sayılar dizin gezilerek okunur, sayaçtan değil —
+          motor kendi takvimine göre birleştirme ve anlık görüntü yazdığı için bir sayaç zamanla
+          gerçekten uzaklaşır ve bunu fark etmenin yolu olmaz.</p>
+      </div>
+      <button class="btn" id="btn-refresh-db">Yenile</button>
+    </div>
+    <div class="stats" id="db-stats"></div>
+    <div class="table-wrap">
+      <div class="table-head"><h2>Veritabanı dizinleri</h2><span class="badge badge-neutral" id="db-count">0</span></div>
+      <table>
+        <thead><tr><th>dbId</th><th>Durum</th><th class="num">MB</th><th>Pay</th></tr></thead>
+        <tbody id="db-body"><tr><td colspan="4" class="empty">yükleniyor…</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ================= KABUL ================= -->
+  <section class="view" id="view-admission">
+    <div class="page-head">
+      <div>
+        <h1>Kabul (mühür)</h1>
+        <p class="page-sub">Bu veritabanı mühürlü açılır ve kimlik sağlayıcısı ona bir sunucu sertifikası
+          verene kadar hiç kimseye hizmet etmez.</p>
+      </div>
+    </div>
+    <div class="stats" id="admission-stats"></div>
+
+    <div class="notice" id="admission-explainer"></div>
+
+    <div class="table-wrap">
+      <div class="table-head"><h2>Kurulu sunucu kimliği</h2></div>
+      <table>
+        <tbody id="admission-identity"><tr><td colspan="2" class="empty">yükleniyor…</td></tr></tbody>
+      </table>
+    </div>
+
+    <div class="table-wrap">
+      <div class="table-head">
+        <h2>Kapıyı kapat</h2>
+      </div>
+      <div style="padding:16px">
+        <p class="page-sub" style="margin-bottom:14px">
+          Kimlik sağlayıcısının ele geçirildiğinden şüpheleniyorsanız, bu düğme veritabanını
+          yeniden mühürler: kurulu sunucu kimliği düşer, geçici önyükleme sertifikası geri gelir ve
+          <strong>her asıl kimlik reddedilir</strong>. Yeniden açılması, IdP'nin baştan sağlaması ile olur.
+          Yeniden başlatma gerektirmez, çünkü böyle bir anda gereken şey yeniden başlatmak değil durdurmaktır.
+        </p>
+        <button class="btn btn-danger" id="btn-seal">Veritabanını mühürle</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= AYARLAR ================= -->
+  <section class="view" id="view-settings">
+    <div class="page-head">
+      <div>
+        <h1>Ayarlar</h1>
+        <p class="page-sub">Bu sürecin çalıştığı yapılandırma. Salt okunur: bunları değiştirmek
+          yapılandırmayı değiştirip yeniden başlatmakla olur, çünkü çoğu açılışta okunur ve
+          canlı değiştirmek "panelde ne yazıyor" ile "süreç ne yapıyor" arasında bir ayrışma yaratır.</p>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <div class="table-head"><h2>Yapılandırma</h2></div>
+      <table><tbody id="settings-body"><tr><td colspan="2" class="empty">yükleniyor…</td></tr></tbody></table>
+    </div>
+    <div class="notice">
+      <strong>Burada olmayan şeyler.</strong> Bu panelin hiçbir CA özel anahtarını okuyabildiği bir
+      ucu yoktur ve olmayacaktır — o malzemeyi şifreli depoya taşımanın bütün amacı kopyalanamaz
+      olmasıydı, ve onu döndüren bir HTTP ucu bunu tek satırda geri alırdı. Panel uygulama verisini
+      de okumaz: boyut bildirir, içerik değil.
+    </div>
+  </section>
+</main>
+
+<div class="modal-backdrop" id="modal-backdrop">
+  <div class="modal">
+    <div class="modal-head" id="modal-title">—</div>
+    <div class="modal-body" id="modal-body"></div>
+    <div class="modal-foot">
+      <button class="btn" id="modal-cancel">Kapat</button>
+      <button class="btn btn-primary" id="modal-save">Kaydet</button>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+  var $ = function (id) { return document.getElementById(id); };
+  var state = { overview: null, services: [], connections: [], databases: [], settings: null };
+
+  // Adres çubuğundaki jeton, sayfa açılır açılmaz siliniyor: sunucu onu zaten
+  // çereze yazdı, ve bir URL geçmişe, ekran görüntüsüne ve omzunuzun üzerinden
+  // bakan herkese gider.
+  if (location.search) history.replaceState(null, '', location.pathname);
+
+  function showErr(m) { $('ok').classList.remove('show'); var e = $('err'); e.textContent = m; e.classList.add('show'); }
+  function showOk(m) { $('err').classList.remove('show'); var e = $('ok'); e.textContent = m; e.classList.add('show'); setTimeout(function () { e.classList.remove('show'); }, 4000); }
+  function clearBanners() { $('err').classList.remove('show'); $('ok').classList.remove('show'); }
+
+  async function api(path, opts) {
+    var res = await fetch(path, Object.assign({ credentials: 'same-origin', headers: { 'content-type': 'application/json' } }, opts || {}));
+    var data = null;
+    try { data = await res.json(); } catch (e) { /* boş gövde */ }
+    if (!res.ok) throw new Error((data && (data.error_description || data.error)) || ('HTTP ' + res.status));
+    return data;
+  }
+  var get = function (p) { return api(p); };
+  var post = function (p, b) { return api(p, { method: 'POST', body: JSON.stringify(b || {}) }); };
+
+  function esc(s) { var d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML; }
+  function fmtDate(ms) { return ms ? new Date(Number(ms)).toLocaleString('tr-TR') : '—'; }
+  function fmtAgo(ms) {
+    if (!ms) return '—';
+    var s = Math.floor((Date.now() - Number(ms)) / 1000);
+    if (s < 60) return s + ' sn önce';
+    if (s < 3600) return Math.floor(s / 60) + ' dk önce';
+    if (s < 86400) return Math.floor(s / 3600) + ' sa önce';
+    return Math.floor(s / 86400) + ' gün önce';
+  }
+  function fmtDur(ms) {
+    var s = Math.floor(Number(ms) / 1000);
+    if (s < 60) return s + ' sn';
+    if (s < 3600) return Math.floor(s / 60) + ' dk';
+    if (s < 86400) return Math.floor(s / 3600) + ' sa ' + Math.floor((s % 3600) / 60) + ' dk';
+    return Math.floor(s / 86400) + ' gün ' + Math.floor((s % 86400) / 3600) + ' sa';
+  }
+  function mb(n) { return (Number(n) || 0).toFixed(2); }
+
+  document.querySelectorAll('.nav-item').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      document.querySelectorAll('.nav-item').forEach(function (b) { b.classList.remove('active'); });
+      btn.classList.add('active');
+      document.querySelectorAll('.view').forEach(function (v) { v.classList.remove('active'); });
+      $('view-' + btn.dataset.view).classList.add('active');
+      clearBanners();
+      if (btn.dataset.view === 'databases') loadDatabases();
+      if (btn.dataset.view === 'connections') loadConnections();
+      if (btn.dataset.view === 'settings') loadSettings();
+    });
+  });
+
+  // ---------- modal ----------
+  var modalSaveHandler = null;
+  function openModal(title, bodyHtml, onSave, saveLabel) {
+    $('modal-title').textContent = title;
+    $('modal-body').innerHTML = bodyHtml;
+    modalSaveHandler = onSave;
+    $('modal-save').textContent = saveLabel || 'Kaydet';
+    $('modal-save').style.display = onSave ? '' : 'none';
+    $('modal-backdrop').classList.add('open');
+  }
+  function closeModal() { $('modal-backdrop').classList.remove('open'); modalSaveHandler = null; }
+  $('modal-cancel').addEventListener('click', closeModal);
+  $('modal-backdrop').addEventListener('click', function (e) { if (e.target === $('modal-backdrop')) closeModal(); });
+  $('modal-save').addEventListener('click', function () {
+    if (!modalSaveHandler) return;
+    var btn = this; var label = btn.textContent;
+    btn.disabled = true; btn.textContent = 'Çalışıyor…';
+    Promise.resolve(modalSaveHandler())
+      // 'KEEP_OPEN' dönen bir işleyici kendi ekranını açmıştır (sırrı gösteren
+      // ekran gibi); onu kapatmak, kullanıcıya bir daha gösterilmeyecek bir
+      // değeri okumadan kapatmak olurdu.
+      .then(function (status) { if (status !== 'KEEP_OPEN') closeModal(); })
+      .catch(function (e) { showErr(e.message); })
+      .finally(function () { btn.disabled = false; btn.textContent = label; });
+  });
+
+  // ---------- GENEL BAKIŞ ----------
+  function renderOverview() {
+    var o = state.overview;
+    if (!o) return;
+    var s = o.summary;
+
+    $('brand-target').textContent = (o.info.listening ? (o.info.listening.address + ':' + o.info.listening.port) : 'bağlanmadı');
+
+    var gate = o.admission;
+    var pill = $('gate-pill');
+    if (!gate) { pill.className = 'gate-pill gate-prov'; pill.textContent = 'kabul kapalı değil'; }
+    else if (gate.state === 'open') { pill.className = 'gate-pill gate-open'; pill.textContent = 'AÇIK'; }
+    else if (gate.state === 'provisioned') { pill.className = 'gate-pill gate-prov'; pill.textContent = 'SAĞLANDI · beklemede'; }
+    else { pill.className = 'gate-pill gate-sealed'; pill.textContent = 'MÜHÜRLÜ'; }
+
+    $('foot-note').textContent = o.info.adminOrigin + ' · yalnızca yerel';
+
+    $('overview-stats').innerHTML =
+      card('Taşınan veri', mb(s.totalMegabytes) + ' MB', 'sıfırlamadan bu yana ' + fmtDur(s.sinceResetMs)) +
+      card('Açık bağlantı', s.liveConnections, s.principals + ' farklı asıl kimlik') +
+      card('Süreç belleği', mb(s.process.rssMegabytes) + ' MB', 'yığın: ' + mb(s.process.heapUsedMegabytes) + ' MB') +
+      card('Çalışma süresi', fmtDur(s.uptimeMs), 'başlangıç: ' + fmtDate(s.startedAt));
+
+    var rows = o.services || [];
+    $('overview-service-count').textContent = rows.length;
+    var tb = $('overview-services');
+    if (!rows.length) { tb.innerHTML = '<tr><td colspan="6" class="empty">Henüz kimse bağlanmadı.</td></tr>'; return; }
+    tb.innerHTML = '';
+    rows.forEach(function (r) {
+      var u = r.usage;
+      var status = r.registered === false
+        ? '<span class="badge badge-acc">kayıtsız</span>'
+        : (r.enabled ? '<span class="badge badge-ok">etkin</span>' : '<span class="badge badge-warn">devre dışı</span>');
+      tb.innerHTML +=
+        '<tr><td><div class="cell-strong">' + esc(r.name) + '</div>'
+        + '<div class="cell-sub mono">' + esc(r.spiffeId || '—') + '</div></td>'
+        + '<td>' + status + '</td>'
+        + '<td class="num">' + (u ? mb(u.megabytes) : '—') + '</td>'
+        + '<td class="num">' + (u ? u.requests : '—') + '</td>'
+        + '<td class="num">' + (u ? u.connectionsLive : 0) + '</td>'
+        + '<td>' + (u ? fmtAgo(u.lastSeenAt) : '—') + '</td></tr>';
+    });
+  }
+
+  function card(label, value, note, cls) {
+    return '<div class="stat"><div class="stat-label">' + esc(label) + '</div>'
+      + '<div class="stat-value ' + (cls || '') + '">' + esc(value) + '</div>'
+      + '<div class="stat-note">' + (note || '') + '</div></div>';
+  }
+
+  async function loadOverview() {
+    try {
+      state.overview = await get('/api/overview');
+      state.services = state.overview.services || [];
+      renderOverview();
+      renderServices();
+      renderAdmission();
+    } catch (e) { showErr(e.message); }
+  }
+
+  $('btn-refresh').addEventListener('click', function () { clearBanners(); loadOverview().then(function () { showOk('Yenilendi.'); }); });
+
+  $('btn-reset-all').addEventListener('click', function () {
+    openModal('Sayaçları sıfırla',
+      '<p>Tüm servislerin bayt ve istek sayaçları sıfırlanacak.</p>'
+      + '<p class="field-hint">Açık bağlantılar kopmaz ve geçmişleri tek seferde yeniden sayılmaz: '
+      + 'sıfırlama anındaki soket değerleri yeni başlangıç noktası olur. Sayaçlar bellekte tutulur, '
+      + 'yani bir yeniden başlatma da aynı şeyi yapar — bu düğme onu beklemeden yapmak içindir.</p>',
+      function () {
+        return post('/api/metrics/reset', {}).then(function () { showOk('Sayaçlar sıfırlandı.'); return loadOverview(); });
+      }, 'Sıfırla');
+  });
+
+  // ---------- BAĞLANTILAR ----------
+  async function loadConnections() {
+    try {
+      var data = await get('/api/connections');
+      state.connections = data.connections || [];
+      var un = data.unattributed || {};
+
+      $('conn-stats').innerHTML =
+        card('Açık bağlantı', state.connections.length, 'anlık') +
+        card('Kimlik doğrulanmış', state.connections.filter(function (c) { return c.authenticated; }).length, 'istemci sertifikası sundu') +
+        card('Atfedilemeyen', mb(un.megabytes) + ' MB', 'el sıkışma ve sertifikasız bağlantılar');
+
+      $('conn-count').textContent = state.connections.length;
+      var tb = $('conn-body');
+      if (!state.connections.length) { tb.innerHTML = '<tr><td colspan="5" class="empty">Açık bağlantı yok.</td></tr>'; return; }
+      tb.innerHTML = '';
+      state.connections.forEach(function (c) {
+        var who = c.authenticated
+          ? '<div class="cell-strong">' + esc(c.principal) + '</div><div class="cell-sub mono">' + esc(c.spiffeId || '—') + '</div>'
+          : '<span class="badge badge-neutral">sertifikasız</span>'
+            + '<div class="cell-sub">denetim düzlemi / kayıt</div>';
+        tb.innerHTML +=
+          '<tr><td>' + who + '</td>'
+          + '<td class="mono cell-sub">' + esc(c.remoteAddress || '—') + '</td>'
+          + '<td>' + fmtAgo(c.openedAt) + '</td>'
+          + '<td class="num">' + c.requests + '</td>'
+          + '<td class="num">' + mb(c.megabytes) + '</td></tr>';
+      });
+    } catch (e) { showErr(e.message); }
+  }
+  $('btn-refresh-conn').addEventListener('click', function () { clearBanners(); loadConnections(); });
+
+  // ---------- SERVİSLER ----------
+  var ROLES = ['reader', 'writer', 'editor', 'schema', 'issuer', 'sharer', 'admin'];
+
+  function renderServices() {
+    var q = ($('service-filter').value || '').toLowerCase();
+    var rows = state.services.filter(function (s) { return !q || s.name.toLowerCase().indexOf(q) >= 0; });
+    $('service-count').textContent = state.services.length;
+
+    var tb = $('services-body');
+    if (!rows.length) { tb.innerHTML = '<tr><td colspan="5" class="empty">Kayıtlı servis yok.</td></tr>'; return; }
+    tb.innerHTML = '';
+    rows.forEach(function (s) {
+      var tr = document.createElement('tr');
+      var secret = s.registered === false
+        ? '<span class="badge badge-acc">kayıt dışı</span><div class="cell-sub">kabul kapısından geçti</div>'
+        : s.credentialSpent
+          ? '<span class="badge badge-ok">harcandı</span><div class="cell-sub">' + (s.enrolledAt ? fmtAgo(s.enrolledAt) : 'kayıt tamamlandı') + '</div>'
+          : '<span class="badge badge-warn">kullanılmadı</span><div class="cell-sub">' + (s.uses || 0) + '/' + s.maxUses + '</div>';
+
+      tr.innerHTML =
+        '<td><div class="cell-strong">' + esc(s.name) + '</div>'
+        + '<div class="cell-sub mono">' + esc(s.spiffeId || '—') + '</div>'
+        + (s.description ? '<div class="cell-sub">' + esc(s.description) + '</div>' : '') + '</td>'
+        + '<td>' + (s.roles || []).map(function (r) { return '<span class="chip">' + esc(r) + '</span>'; }).join('') + '</td>'
+        + '<td>' + secret + '</td>'
+        + '<td class="num">' + (s.usage ? mb(s.usage.megabytes) : '—') + '</td>'
+        + '<td><div class="btn-row"></div></td>';
+      var actions = tr.querySelector('.btn-row');
+
+      if (s.registered !== false) {
+        actions.appendChild(button('Düzenle', 'btn btn-sm', function () { openServiceModal(s); }));
+        actions.appendChild(button('Sır döndür', 'btn btn-sm', function () { rotateSecret(s); }));
+        actions.appendChild(button('Sil', 'btn btn-sm btn-danger', function () { removeService(s); }));
+      }
+      if (s.usage) {
+        actions.appendChild(button('Sayacı sıfırla', 'btn btn-sm', function () {
+          post('/api/metrics/reset', { principal: s.name })
+            .then(function () { showOk(s.name + ' sayacı sıfırlandı.'); return loadOverview(); })
+            .catch(function (e) { showErr(e.message); });
+        }));
+      }
+      tb.appendChild(tr);
+    });
+  }
+
+  function button(text, cls, onClick) {
+    var b = document.createElement('button');
+    b.className = cls; b.textContent = text;
+    b.addEventListener('click', onClick);
+    return b;
+  }
+
+  function roleCheckboxes(selected) {
+    return ROLES.map(function (r) {
+      var checked = (selected || []).indexOf(r) >= 0 ? 'checked' : '';
+      return '<div class="check-row"><input type="checkbox" id="role-' + r + '" value="' + r + '" ' + checked + '>'
+        + '<label for="role-' + r + '">' + r + '</label></div>';
+    }).join('');
+  }
+  function readRoles() { return ROLES.filter(function (r) { return $('role-' + r).checked; }); }
+
+  function openServiceModal(existing) {
+    var isEdit = !!existing;
+    var html =
+      (isEdit
+        ? '<div class="secret-reveal"><span class="label">SPIFFE kimliği</span>' + esc(existing.spiffeId) + '</div>'
+        : '<label>Servis adı</label><input type="text" id="svc-name" placeholder="dns-resolver">'
+          + '<div class="field-hint">Küçük harf, rakam ve tire. SPIFFE kimliği bundan türetilir: '
+          + '<span class="mono">spiffe://&lt;alan&gt;/service/&lt;ad&gt;</span></div>')
+      + '<label>Açıklama</label><input type="text" id="svc-desc" value="' + esc(isEdit ? existing.description : '') + '" placeholder="DNS çözümleyici">'
+      + '<label>Roller</label>' + roleCheckboxes(isEdit ? existing.roles : ['reader'])
+      + '<div class="field-hint">Bunlar SUNUCU GENELİ yetkilerdir: bu asıl kimliğin sunucudan ne '
+      + 'isteyebileceğini belirler. Belirli bir veritabanı üzerindeki yetki ayrıdır ve o veritabanının '
+      + 'ACL\'inde durur — yani buradaki <span class="mono">admin</span>, başka bir servisin verisine erişim vermez.</div>'
+      + '<label>Ek adlar (her satıra bir tane)</label>'
+      + '<textarea id="svc-sans" placeholder="dns.internal.fitfak.net">' + esc(((isEdit ? existing.altNames : []) || []).filter(function (n) {
+        return n !== (isEdit ? existing.name : '') && String(n).indexOf('spiffe://') !== 0;
+      }).join('\n')) + '</textarea>'
+      + '<div class="field-hint">SPIFFE kimliği ve servis adı otomatik eklenir.</div>'
+      + '<label>Kayıt sırrı kaç kez kullanılabilir</label>'
+      + '<input type="number" id="svc-maxuses" min="1" max="10" value="' + (isEdit ? existing.maxUses : 1) + '">'
+      + '<div class="field-hint">Varsayılan 1 ve neredeyse her zaman doğru olan bu: servis sertifikasını '
+      + 'aldıktan sonra yenilemeyi mTLS üzerinden yapar ve sırra bir daha ihtiyaç duymaz. Yeniden '
+      + 'başlatmalar için yükseltmeye gerek yok — saklanan sertifika ile devam eder.</div>';
+
+    openModal(isEdit ? ('Servisi düzenle — ' + existing.name) : 'Uygulama kaydet', html, function () {
+      var sans = $('svc-sans').value.split('\n').map(function (s) { return s.trim(); }).filter(Boolean);
+      var payload = {
+        description: $('svc-desc').value.trim(),
+        roles: readRoles(),
+        altNames: sans,
+        maxUses: Number($('svc-maxuses').value) || 1,
+      };
+
+      if (isEdit) {
+        payload.name = existing.name;
+        return post('/api/services/update', payload).then(function () {
+          showOk('Servis güncellendi.'); return loadOverview();
+        });
+      }
+
+      payload.name = $('svc-name').value.trim();
+      return post('/api/services', payload).then(function (created) {
+        loadOverview();
+        revealSecret(created.service.name, created.secret, created.service.spiffeId);
+        return 'KEEP_OPEN';
+      });
+    }, isEdit ? 'Güncelle' : 'Kaydet');
+  }
+
+  function revealSecret(name, secret, spiffeId) {
+    openModal('Kayıt sırrı — ' + name,
+      '<p>Bu sır <strong>yalnızca şimdi</strong> gösterilir. Onu geri döndüren bir uç nokta yok; '
+      + 'kaybederseniz yenisini döndürmeniz gerekir.</p>'
+      + '<div class="secret-reveal"><span class="label">SPIFFE kimliği</span>' + esc(spiffeId) + '</div>'
+      + '<div class="secret-reveal"><span class="label">FITFAK_ENROLMENT_SECRET</span>' + esc(secret) + '</div>'
+      + '<p class="field-hint">Servisin ortamına koyun. İlk sertifikasını aldıktan sonra bu değişkeni '
+      + 'kaldırabilirsiniz — yenileme mTLS üzerinden yapılır ve sırra bir daha dokunmaz.</p>', null);
+  }
+
+  function rotateSecret(s) {
+    openModal('Kayıt sırrını döndür — ' + s.name,
+      '<p>Yeni bir sır üretilecek ve kullanım sayacı sıfırlanacak.</p>'
+      + '<p class="field-hint">Bu, halihazırda bağlı olan servisi ETKİLEMEZ: onun sertifikası geçerli '
+      + 'kalır ve yenilemesi mTLS üzerinden yürür. Yeni sır yalnızca sıfırdan sağlama için gerekir.</p>',
+      function () {
+        return post('/api/services/rotate', { name: s.name }).then(function (r) {
+          loadOverview();
+          revealSecret(s.name, r.secret, s.spiffeId);
+          return 'KEEP_OPEN';
+        });
+      }, 'Döndür');
+  }
+
+  function removeService(s) {
+    openModal('Servisi sil — ' + s.name,
+      '<p>“' + esc(s.name) + '” kaydı silinecek.</p>'
+      + '<p class="field-hint">Sertifikası kriptografik olarak ne kadar geçerli kalırsa kalsın, '
+      + 'BİR SONRAKİ bağlantısında reddedilir: bu katmanda iptal mekanizması izin listesidir. '
+      + 'Zaten açık olan bir bağlantı kopmaz.</p>',
+      function () {
+        return post('/api/services/remove', { name: s.name }).then(function () {
+          showOk('Servis silindi.'); return loadOverview();
+        });
+      }, 'Sil');
+  }
+
+  $('service-filter').addEventListener('input', renderServices);
+  $('btn-new-service').addEventListener('click', function () { openServiceModal(null); });
+
+  // ---------- VERİTABANLARI ----------
+  async function loadDatabases() {
+    try {
+      var data = await get('/api/storage');
+      state.databases = data.databases || [];
+      var total = state.databases.reduce(function (sum, d) { return sum + d.bytes; }, 0);
+
+      $('db-stats').innerHTML =
+        card('Toplam', mb(total / 1048576) + ' MB', state.databases.length + ' veritabanı') +
+        card('Açık', state.databases.filter(function (d) { return d.open; }).length, 'bu süreçte yüklü') +
+        card('En büyük', state.databases.length ? mb(state.databases[0].megabytes) + ' MB' : '—',
+          state.databases.length ? esc(String(state.databases[0].dbId).slice(0, 18)) : '');
+
+      $('db-count').textContent = state.databases.length;
+      var tb = $('db-body');
+      if (!state.databases.length) { tb.innerHTML = '<tr><td colspan="4" class="empty">Henüz veritabanı yok.</td></tr>'; return; }
+      tb.innerHTML = '';
+      state.databases.forEach(function (d) {
+        var pct = total ? Math.round((d.bytes / total) * 100) : 0;
+        tb.innerHTML +=
+          '<tr><td class="mono cell-sub">' + esc(d.dbId) + '</td>'
+          + '<td>' + (d.open ? '<span class="badge badge-ok">açık</span>' : '<span class="badge badge-neutral">kapalı</span>') + '</td>'
+          + '<td class="num">' + mb(d.megabytes) + '</td>'
+          + '<td style="width:180px"><div class="bar"><i style="width:' + pct + '%"></i></div>'
+          + '<div class="cell-sub">%' + pct + '</div></td></tr>';
+      });
+    } catch (e) { showErr(e.message); }
+  }
+  $('btn-refresh-db').addEventListener('click', function () { clearBanners(); loadDatabases(); });
+
+  // ---------- KABUL ----------
+  function renderAdmission() {
+    var gate = state.overview && state.overview.admission;
+    if (!gate) {
+      $('admission-stats').innerHTML = card('Kabul', 'yapılandırılmadı', 'bu sunucu mühürsüz açıldı');
+      $('admission-explainer').innerHTML = '<strong>Kabul denetimi kapalı.</strong> Bu süreç '
+        + '<span class="mono">admission</span> seçeneği olmadan açılmış, yani geleneksel şekilde '
+        + 'davranıyor: sertifikası olan herkes veri düzlemine ulaşabilir. Mühürleme, kimlik '
+        + 'sağlayıcısı ayağa kalkmadan hiçbir servisin bağlanamamasını sağlar.';
+      $('admission-identity').innerHTML = '<tr><td colspan="2" class="empty">—</td></tr>';
+      return;
+    }
+
+    var stateLabel = gate.state === 'open' ? 'AÇIK' : gate.state === 'provisioned' ? 'SAĞLANDI' : 'MÜHÜRLÜ';
+    $('admission-stats').innerHTML =
+      card('Durum', stateLabel, gate.state === 'open' ? 'her yetkili asıl kimlik kabul ediliyor' : 'yalnızca kimlik sağlayıcısı') +
+      card('Denetim asıl kimliği', gate.controlPrincipal, '', 'sm') +
+      card('Açılış', gate.openedAt ? fmtAgo(gate.openedAt) : '—', gate.openedAt ? fmtDate(gate.openedAt) : 'henüz açılmadı') +
+      card('Bekleme bitişi', gate.holdExpiresAt ? fmtDate(gate.holdExpiresAt) : '—',
+        gate.holdExpiresAt ? 'tamamlanmazsa yeniden mühürlenir' : '');
+
+    var explain;
+    if (gate.state === 'sealed') {
+      explain = '<strong>Mühürlü.</strong> Bu veritabanının bir sertifika otoritesi yok, kimseyi '
+        + 'tanımıyor ve hiç kimseye hizmet etmiyor. Açılışta bellekte üretilen, hiçbir yere '
+        + 'yazılmayan geçici bir sertifika takıyor. Tek erişilebilir şey, kimlik sağlayıcısının '
+        + 'gerçek sunucu sertifikasını kurduğu denetim düzlemi. <span class="mono">'
+        + esc(gate.controlPrincipal) + '</span> bağlanana kadar bu böyle kalır.';
+    } else if (gate.state === 'provisioned') {
+      explain = '<strong>Sağlandı, ama hâlâ kapalı.</strong> Sunucu kimliği kuruldu ve bellekte '
+        + 'tutuluyor. Kimlik sağlayıcısı kendi istemci sertifikasıyla geri bağlanana kadar kapı '
+        + 'açılmaz — ve bekleme süresi dolarsa malzeme silinip yeniden mühürlenir. Sağlama, kabul '
+        + 'demek değildir.';
+    } else {
+      explain = '<strong>Açık.</strong> Kimlik sağlayıcısı karşılıklı kimlik doğrulamalı bir '
+        + 'bağlantı kurdu ve veritabanı her yetkili asıl kimliğe açıldı. Kurulu sunucu anahtarı '
+        + 'yalnızca bellektedir: bu süreç yeniden başlarsa kimlik sağlayıcısı onu baştan sağlar, '
+        + 've diskte kalan bir anahtar olmaz.';
+    }
+    $('admission-explainer').innerHTML = explain;
+
+    var id = gate.identity;
+    $('admission-identity').innerHTML = id
+      ? row('Konu', id.subject) + row('Parmak izi', id.fingerprint256, true)
+        + row('Geçerlilik sonu', fmtDate(id.notAfter))
+        + row('Denetim SPIFFE kimliği', gate.controlSpiffeId || '—', true)
+      : '<tr><td colspan="2" class="empty">Henüz bir sunucu kimliği kurulmadı.</td></tr>';
+  }
+
+  function row(label, value, mono) {
+    return '<tr><td style="width:220px" class="cell-strong">' + esc(label) + '</td>'
+      + '<td class="' + (mono ? 'mono cell-sub' : '') + '">' + esc(value == null ? '—' : value) + '</td></tr>';
+  }
+
+  $('btn-seal').addEventListener('click', function () {
+    openModal('Veritabanını mühürle',
+      '<p>Kurulu sunucu kimliği düşecek, geçici önyükleme sertifikası geri gelecek ve '
+      + '<strong>her asıl kimlik reddedilecek</strong>.</p>'
+      + '<p class="field-hint">Zaten açık olan bağlantılar kopmaz, ama bir sonraki istekleri '
+      + 'reddedilir. Yeniden açılması, kimlik sağlayıcısının baştan sağlaması ile olur.</p>'
+      + '<label>Sebep</label><input type="text" id="seal-reason" placeholder="kimlik sağlayıcısının ele geçirildiğinden şüpheleniliyor">',
+      function () {
+        return post('/api/admission/seal', { reason: $('seal-reason').value.trim() || undefined })
+          .then(function () { showOk('Veritabanı mühürlendi.'); return loadOverview(); });
+      }, 'Mühürle');
+  });
+
+  // ---------- AYARLAR ----------
+  var SETTING_LABELS = {
+    baseDir: 'Veri dizini',
+    trustDomain: 'Güven alanı',
+    requireSpiffeId: 'SPIFFE kimliği zorunlu',
+    subjectField: 'Kimlik alanı',
+    sessionTtlMs: 'Oturum ömrü (ms)',
+    maxScanLimit: 'Azami tarama',
+    maxFindLimit: 'Azami arama',
+    capabilityMaxTtlMs: 'Yetenek jetonu azami ömrü (ms)',
+    strictFields: 'Bilinmeyen alanları reddet',
+    autoGrantOwner: 'Oluşturana otomatik yönetici',
+    admissionHoldMs: 'Kabul bekleme süresi (ms)',
+    metricsSampleIntervalMs: 'Ölçüm örnekleme aralığı (ms)',
+  };
+
+  async function loadSettings() {
+    try {
+      state.settings = await get('/api/settings');
+      var tb = $('settings-body');
+      tb.innerHTML = '';
+      Object.keys(SETTING_LABELS).forEach(function (key) {
+        var value = state.settings[key];
+        if (value === undefined) return;
+        if (typeof value === 'boolean') value = value ? 'evet' : 'hayır';
+        tb.innerHTML += row(SETTING_LABELS[key], value == null ? '—' : value, true);
+      });
+    } catch (e) { showErr(e.message); }
+  }
+
+  // ---------- başlangıç ----------
+  loadOverview();
+  loadConnections();
+  // Otomatik yenileme yalnızca genel bakış ve bağlantılar için, ve seyrek: bir
+  // yönetim paneli, izlediği süreç üzerinde ölçülebilir bir yük olmamalı.
+  setInterval(function () {
+    if ($('view-overview').classList.contains('active')) loadOverview();
+    else if ($('view-connections').classList.contains('active')) loadConnections();
+  }, 10000);
+}());
+</script>
+</body>
+</html>

@@ -35,6 +35,10 @@ const { PkiVault, PkiVaultError, AUTHORITY_ROLES, PURPOSES } = require('./pki-va
 // should not have to have @fitfak/grpc installed.
 const spiffe = require('./provisioning/spiffe');
 const identityBinding = require('./provisioning/identity-binding');
+// Operations: what each service costs and who may connect. Neither needs the transport --
+// metrics reads socket counters it is handed, and the registry is a JSON file with a Map.
+const { ServiceMetrics, createServiceMetrics } = require('./admin/metrics');
+const { ServiceRegistry } = require('./admin/service-registry');
 const { DnsStore, ZoneCache, DNS_RECORDS_SCHEMA_FIELDS, DNS_RECORD_TYPES } = require('./dns-store');
 const logger = require('./logger');
 
@@ -65,6 +69,7 @@ module.exports = {
   spiffe,
   assertIdentityMatchesGrant: identityBinding.assertIdentityMatchesGrant,
   assertSpiffeMatchesGrant: identityBinding.assertSpiffeMatchesGrant,
+  ServiceMetrics, createServiceMetrics, ServiceRegistry,
   DnsStore, ZoneCache, DNS_RECORDS_SCHEMA_FIELDS, DNS_RECORD_TYPES,
   // Structured logging. `logger.configure({ sink })` hands every engine line to a host
   // application's logger, which is how @fitfak/smtp gets database internals in its own stream.

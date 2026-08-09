@@ -34,6 +34,9 @@ const lazy = {
   get controlPlaneClient() { return require('./src/provisioning/control-plane-client'); },
   get admissionGate() { return require('./src/provisioning/admission-gate'); },
   get bootstrapIdentity() { return require('./src/provisioning/bootstrap-identity'); },
+  // The admin surface pulls in node:http and reads a panel file from disk, so it stays behind a
+  // getter like the transport: a process embedding the engine should not pay for it.
+  get adminServer() { return require('./src/admin/admin-server'); },
 };
 
 module.exports = {
@@ -102,4 +105,8 @@ module.exports = {
   get generateBootstrapSecret() { return lazy.controlPlaneService.generateBootstrapSecret; },
   get provisionServerIdentity() { return lazy.controlPlaneClient.provisionServerIdentity; },
   get readAdmissionStatus() { return lazy.controlPlaneClient.readAdmissionStatus; },
+
+  // ---- operations ------------------------------------------------------------------------------
+  get createAdminServer() { return lazy.adminServer.createAdminServer; },
+  get AdminServer() { return lazy.adminServer.AdminServer; },
 };
