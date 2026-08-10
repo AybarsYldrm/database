@@ -323,6 +323,41 @@ Two ways, and the difference between them is the point.
 
 The panel displays which of the two is holding the door open, because they are not equivalent.
 
+### A branch application in one call
+
+`joinAsService` is everything `examples/app-client.js` demonstrates, as a supported call:
+
+```js
+const { joinAsServiceWhenReady } = require('@fitfak/database');
+
+const service = await joinAsServiceWhenReady({ serviceName: 'dns-resolver', roles: ['reader', 'writer'] });
+const records = service.db.collection('records');
+```
+
+`examples/app-client.js` is still worth reading to understand what happens — and worth **not**
+copying into an application. It is about 200 lines, every application needed its own copy, and
+every copy is a place for one step to be dropped. The steps that get dropped are predictable, and
+none of them fail in a way that points back at the step:
+
+| Dropped | What it looks like instead |
+|---|---|
+| Persisting the certificate | Every restart enrols again, so the single-shot secret has to become a standing credential. Nothing looks wrong until someone asks why it has been used forty times. |
+| Renewing | Works perfectly for hours, then a TLS handshake failure that never mentions expiry. |
+| Pinning the **root**, not the leaf | Breaks daily — the server certificate is regenerated on every boot, which is the point of the sealed bootstrap. |
+| Retrying while sealed | The application cannot be started before the IdP, because it treats a normal ordering as fatal. |
+
+Two things it deliberately will not do: invent an enrolment secret, or read one from the pairing
+directory. That secret is one service's credential, shown once in the admin panel — a secret
+readable from a shared directory would be one every process on the host could enrol with, and the
+identity model would reduce to "can you read /var/lib/fitfak".
+
+`joinAsService` throws on a sealed database; `joinAsServiceWhenReady` retries. They are separate
+because they mean different things: a one-shot task should exit when misconfigured, a long-running
+service should survive being started first. Only the sealed case is retried — retrying a wrong
+secret would turn a clear failure into a service that never starts and never says why.
+
+A worked version is `examples/branch-service.js`.
+
 ### An ordinary application connecting
 
 Nothing changes for services that are not the IdP. They enrol as before — the only difference is

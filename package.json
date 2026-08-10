@@ -54,7 +54,7 @@
     "test:admission": "node test/admission-gate-demo.js",
     "test:pki-vault": "node test/pki-vault-demo.js",
     "test:admin-panel": "node test/admin-panel-demo.js",
-    "test:zero-trust": "npm run test:spiffe && npm run test:admission && npm run test:pki-vault && npm run test:admin-panel && npm run test:admin-auth",
+    "test:zero-trust": "npm run test:spiffe && npm run test:admission && npm run test:pki-vault && npm run test:admin-panel && npm run test:admin-auth && npm run test:service-identity",
     "test:bootstrap-resume": "node test/bootstrap-resume-demo.js",
     "test:engine": "npm run test:basic && npm run test:direct && npm run test:mls && npm run test:crypto-offload && npm run test:index-snapshot && npm run test:range-query && npm run test:disk-backed-index && npm run test:object-store && npm run test:object-direct && npm run test:schema",
     "test:multi-client": "node test/multi-client-demo.js",
@@ -63,7 +63,8 @@
     "link:grpc": "node scripts/link-grpc.js",
     "test:schema": "node test/schema-migration-demo.js",
     "start": "node bin/db-server.js",
-    "test:admin-auth": "node test/admin-auth-demo.js"
+    "test:admin-auth": "node test/admin-auth-demo.js",
+    "test:service-identity": "node test/service-identity-demo.js"
   },
   "dependencies": {
     "@fitfak/grpc": "^2.0.0"
