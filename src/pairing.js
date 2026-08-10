@@ -107,13 +107,29 @@ async function readJson(dir, name, logger) {
   }
 }
 
-/** What this database publishes: where to reach it and the control plane's shared secret. */
-async function publishDatabase({ dir, target, controlSecret, bootstrapFingerprint, trustDomain, logger }) {
+/**
+ * What this database publishes: where to reach it, the control plane's shared secret, and the
+ * admin API the identity provider's surface drives it through.
+ *
+ * The admin token here is NOT the break-glass token printed at boot. That one is for a person
+ * during an incident and is regenerated every restart; this one is stable and machine-to-machine,
+ * so an operator working from one.fitfak.net never sees a token at all.
+ *
+ * Putting it in this directory adds no exposure that was not already here: the control-plane
+ * secret in the same file can replace this database's server identity, which is strictly more
+ * than the admin API can do.
+ */
+async function publishDatabase({
+  dir, target, controlSecret, bootstrapFingerprint, trustDomain,
+  adminApiUrl = null, adminApiToken = null, logger,
+}) {
   return writeJson(pairingDir(dir), DATABASE_FILE, {
     target,
     controlSecret: Buffer.isBuffer(controlSecret) ? controlSecret.toString('base64') : controlSecret,
     bootstrapFingerprint,
     trustDomain,
+    adminApiUrl,
+    adminApiToken,
   }, logger);
 }
 

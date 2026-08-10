@@ -82,10 +82,12 @@ class AdminServer {
    * @param {boolean} [opts.allowNonLoopback=false]
    * @param {object}  [opts.info]       static facts for the overview (target address, trust domain…)
    * @param {object}  [opts.idpAuth]    an IdpAuth; when absent the panel is token-only
+   * @param {string}  [opts.apiToken]   machine credential for the IdP's admin surface
    */
   constructor({
     server, metrics, registry, host = '127.0.2.1', port = 80,
-    token = null, allowNonLoopback = false, info = {}, logger = null, idpAuth = null,
+    token = null, apiToken = null, allowNonLoopback = false, info = {}, logger = null,
+    idpAuth = null,
   }) {
     if (!server) throw new Error('fitdb admin: a DatabaseServer is required');
     if (!metrics) throw new Error('fitdb admin: ServiceMetrics is required');
@@ -111,6 +113,17 @@ class AdminServer {
     this._log = logger;
     this.idpAuth = idpAuth;
     this.token = token || crypto.randomBytes(24).toString('base64url');
+    // A SECOND credential, for the identity provider's admin surface rather than for a person.
+    //
+    // Separate from the browser token on purpose. That one is regenerated every boot and is
+    // meant to be pasted by a human during an incident; this one is stable, lives in the pairing
+    // directory, and is used machine-to-machine so one.fitfak.net can show and drive this
+    // database without an operator ever seeing a token. Sharing one value would mean rotating
+    // the human's break-glass credential silently breaks the admin surface, and vice versa.
+    //
+    // It grants the same API. The separation is about lifecycle and revocation, not scope --
+    // claiming otherwise would be the kind of split where one of the two stops being checked.
+    this.apiToken = apiToken || null;
     this.origin = `http://${host}${port === 80 ? '' : `:${port}`}`;
     this.http = null;
 
@@ -242,8 +255,15 @@ class AdminServer {
       const found = this.idpAuth.resolveSession(sid);
       if (found) return { ...found, sid };
     }
-    if (this._tokenMatches(this._suppliedToken(req))) {
+    const supplied = this._suppliedToken(req);
+    if (this._tokenMatches(supplied)) {
       return { via: 'token', username: 'break-glass token', role: null, sub: null };
+    }
+    // The identity provider's admin surface, calling on behalf of an operator it has already
+    // authenticated. Reported distinctly so the panel never claims a person is present when the
+    // caller is another process.
+    if (this._apiTokenMatches(supplied)) {
+      return { via: 'idp-admin', username: 'one.fitfak.net', role: 'admin', sub: null };
     }
     return null;
   }
@@ -350,9 +370,17 @@ class AdminServer {
   }
 
   _tokenMatches(supplied) {
-    if (!supplied) return false;
+    return this._constantTimeEquals(supplied, this.token);
+  }
+
+  _apiTokenMatches(supplied) {
+    return !!this.apiToken && this._constantTimeEquals(supplied, this.apiToken);
+  }
+
+  _constantTimeEquals(supplied, expected) {
+    if (!supplied || !expected) return false;
     const a = Buffer.from(String(supplied));
-    const b = Buffer.from(this.token);
+    const b = Buffer.from(String(expected));
     // Length is compared separately because timingSafeEqual throws on a mismatch; the length of
     // a token is not a secret worth protecting, its contents are.
     return a.length === b.length && crypto.timingSafeEqual(a, b);

@@ -144,6 +144,11 @@ async function main() {
   // obtaining a client certificate for one named service. Sharing one value between them would mean
   // a service's provisioning credential could re-key the database it connects to.
   const controlSecret = loadOrCreateSecret('control-plane-secret');
+  // The credential the identity provider's admin surface uses to drive this database.
+  //
+  // Persistent, unlike the browser token: the IdP reads it from the pairing directory and a value
+  // that changed every boot would mean the admin surface breaks until the IdP restarts too.
+  const adminApiSecret = loadOrCreateSecret('admin-api-token').toString('base64url');
 
   // ---- the registry the panel writes to --------------------------------------------------------
   //
@@ -278,6 +283,11 @@ async function main() {
     controlSecret,
     bootstrapFingerprint: bootstrapIdentity.fingerprint256,
     trustDomain: TRUST_DOMAIN,
+    // Where the identity provider's admin surface reaches this database's API, and with what.
+    // Published only when the panel is running -- advertising an address that answers nothing
+    // would send the IdP into a retry loop over something that is switched off on purpose.
+    adminApiUrl: ADMIN_ENABLED ? `http://${ADMIN_HOST}${ADMIN_PORT === 80 ? '' : `:${ADMIN_PORT}`}` : null,
+    adminApiToken: ADMIN_ENABLED ? adminApiSecret : null,
     logger: log,
   });
 
@@ -294,6 +304,9 @@ async function main() {
       // history and a chat message, and this one costs nothing to reissue. It is the break-glass
       // path; the everyday one is the identity provider, installed below when it appears.
       token: crypto.randomBytes(24).toString('base64url'),
+      // The machine credential, so one.fitfak.net can show and drive this database without an
+      // operator ever handling a token.
+      apiToken: adminApiSecret,
       logger: log,
       info: {
         trustDomain: TRUST_DOMAIN,
