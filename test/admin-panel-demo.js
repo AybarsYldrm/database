@@ -351,7 +351,50 @@ async function main() {
   check('and possible when explicitly allowed', allowed.host === '0.0.0.0');
 
   await fsp.rm(stateDir, { recursive: true, force: true });
-  console.log(`\nOK - admin panel: ${checks} checks passed.`);
+  
+// ---------------------------------------------------------------------------------------------
+console.log('\nX. A closing connection cannot take the database down');
+
+{
+  // `session.socket` is a PROXY. Node's http2 core throws ERR_HTTP2_SOCKET_UNBOUND from every
+  // property on it once the session has detached -- which has already happened by the time the
+  // session's own 'close' handler runs. Reading `bytesRead` there was therefore guaranteed to
+  // throw, inside an event listener, which is fatal.
+  //
+  // The database died a few seconds after starting, on the first connection that ever closed.
+  // From every client it read as "the database is not listening", and the actual cause was one
+  // line in a log that had already scrolled past.
+  const metrics = new ServiceMetrics({ baseDir: '/tmp' });
+
+  const detached = {
+    get bytesRead() { throw Object.assign(new Error('The socket has been disconnected from the Http2Session'), { code: 'ERR_HTTP2_SOCKET_UNBOUND' }); },
+    get bytesWritten() { throw new Error('same'); },
+  };
+  const record = { id: 1, principal: 'tunnel', spiffeId: null, bytesIn: 10, bytesOut: 20, socket: detached, openedAt: Date.now(), requests: 0 };
+
+  let threw = false;
+  try { metrics._sampleConnection(record); } catch (_) { threw = true; }
+  check('reading a detached socket does not throw', !threw);
+  // The last known values survive: a failed read should lose a sample, not a connection's history.
+  check('the previous totals are kept', record.bytesIn === 10 && record.bytesOut === 20);
+
+  // And the real socket is what gets tracked in the first place, so the throw above should be
+  // unreachable in practice.
+  const fakeSession = { on() {}, once() {} };
+  const realSocket = { bytesRead: 100, bytesWritten: 200, remoteAddress: '127.0.0.1' };
+  const socketSymbol = Symbol('socket');
+  fakeSession[socketSymbol] = realSocket;
+  Object.defineProperty(fakeSession, 'socket', {
+    get() { throw new Error('proxy accessed — the underlying socket should have been used'); },
+  });
+  let tracked = true;
+  try { metrics._trackSession(fakeSession); } catch (_) { tracked = false; }
+  check('the underlying socket is used, not the proxy', tracked);
+
+  metrics.close();
+}
+
+console.log(`\nOK - admin panel: ${checks} checks passed.`);
 }
 
 function fakeDatabaseServer() {

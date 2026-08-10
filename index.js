@@ -120,6 +120,15 @@ module.exports = {
   // compute alone. Not lazy: it is a few functions over fs and both processes touch it at boot.
   pairing: require('./src/pairing'),
 
+  // ---- joining as a service ------------------------------------------------------------------
+  // Everything examples/app-client.js demonstrates, as one supported call: discovery,
+  // enrol-or-resume, persistence, auto-renewal and connect. Copying those steps per application
+  // is how one of them gets dropped, and each omission fails in a way that does not look like
+  // the step that was missed.
+  get joinAsService() { return require('./src/service-identity').joinAsService; },
+  get joinAsServiceWhenReady() { return require('./src/service-identity').joinAsServiceWhenReady; },
+  get isSealedError() { return require('./src/service-identity').isSealedError; },
+
   // ---- dependency guard --------------------------------------------------------------------
   // Verifies the signing library produces certificates that match the CSR's private key. An old
   // version does not, and the failure only surfaces in a TLS handshake somewhere else entirely.

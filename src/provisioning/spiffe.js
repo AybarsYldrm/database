@@ -248,8 +248,32 @@ function fromCertificate(certificate) {
   return found[0];
 }
 
+/**
+ * The SAN entries of a certificate, whichever shape it arrived in.
+ *
+ * THREE spellings, and the third one is the one that mattered.
+ *
+ *   altNames         what this codebase's own certificate objects use
+ *   subjectAltName   Node's X509Certificate class property
+ *   subjectaltname   what tls.TLSSocket#getPeerCertificate() returns -- ALL LOWERCASE
+ *
+ * Only the first two were read, and the consequence was total: every peer arriving over a real
+ * TLS connection presented its certificate through `getPeerCertificate()`, so its SAN was never
+ * found, so its SPIFFE ID was always null. With `requireSpiffeId` on -- which is the whole
+ * identity model here -- that meant NO SERVICE COULD EVER CONNECT. The identity provider itself
+ * could not complete the connection that opens the database, so the database re-sealed on every
+ * boot, forever.
+ *
+ * It passed every test because the tests build certificate objects by hand, in the shapes this
+ * function already knew. The code and the tests agreed with each other and both were wrong about
+ * what Node actually hands you -- which is why the check below is now written against the real
+ * spelling first.
+ */
 function normalizeAltNames(certificate) {
-  const raw = certificate.altNames || certificate.subjectAltName || [];
+  const raw = certificate.altNames
+    || certificate.subjectaltname
+    || certificate.subjectAltName
+    || [];
   const list = Array.isArray(raw) ? raw : String(raw).split(',');
   return list.map((entry) => String(entry).trim()).filter(Boolean);
 }

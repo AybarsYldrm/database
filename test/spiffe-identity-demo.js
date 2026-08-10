@@ -127,7 +127,47 @@ function main() {
     () => verify({ altNames: ['URI:spiffe://other.example/service/idp'] }));
   rejects('a peer with no SPIFFE ID at all is refused', () => verify({ altNames: ['DNS:idp.fitfak.net'] }));
 
-  console.log(`\nOK - SPIFFE identity: ${checks} checks passed.`);
+  
+// ---------------------------------------------------------------------------------------------
+console.log('\nX. The shape Node actually hands you');
+
+{
+  // THIS IS THE SHAPE THAT MATTERS, and it was the one not handled.
+  //
+  // tls.TLSSocket#getPeerCertificate() returns the SANs under `subjectaltname` -- all lowercase.
+  // Only `altNames` and `subjectAltName` were read, so every peer arriving over a real TLS
+  // connection had no SPIFFE ID as far as this code was concerned. With requireSpiffeId on --
+  // which is the entire identity model -- no service could connect at all, including the identity
+  // provider, so the database re-sealed on every boot forever.
+  //
+  // Every existing test passed, because they all build certificate objects by hand in the shapes
+  // the code already knew. The code and the tests agreed with each other and were both wrong
+  // about reality, which is why this block leads with the real spelling.
+  check('getPeerCertificate() spelling is read',
+    String(spiffe.fromCertificate({ subject: { CN: 'idp-service' }, subjectaltname: 'URI:spiffe://fitfak.net/service/idp' }))
+      === 'spiffe://fitfak.net/service/idp');
+
+  // Node joins multiple SANs with ", " in that same string, and the SPIFFE ID is rarely first.
+  check('found among other SAN types',
+    String(spiffe.fromCertificate({ subjectaltname: 'DNS:db.fitfak.net, IP Address:127.0.0.1, URI:spiffe://fitfak.net/service/tunnel' }))
+      === 'spiffe://fitfak.net/service/tunnel');
+
+  // The other two spellings still work: X509Certificate uses subjectAltName, and this package's
+  // own certificate objects use altNames.
+  check('X509Certificate spelling still read',
+    String(spiffe.fromCertificate({ subjectAltName: 'URI:spiffe://fitfak.net/service/idp' }))
+      === 'spiffe://fitfak.net/service/idp');
+  check('internal spelling still read',
+    String(spiffe.fromCertificate({ altNames: ['URI:spiffe://fitfak.net/service/idp'] }))
+      === 'spiffe://fitfak.net/service/idp');
+
+  // A peer with no SAN at all is still null rather than a throw: the bootstrap and enrolment
+  // endpoints are legitimately reachable without a client certificate.
+  check('no SAN is null, not an error', spiffe.fromCertificate({ subject: { CN: 'x' } }) === null);
+  check('no certificate is null', spiffe.fromCertificate(null) === null);
+}
+
+console.log(`\nOK - SPIFFE identity: ${checks} checks passed.`);
 }
 
 try { main(); }

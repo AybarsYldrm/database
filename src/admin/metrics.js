@@ -86,7 +86,21 @@ class ServiceMetrics extends EventEmitter {
   }
 
   _trackSession(session) {
-    const socket = session.socket;
+    // `session.socket` is a PROXY, not the socket.
+    //
+    // Node returns a proxy whose every property access throws ERR_HTTP2_SOCKET_UNBOUND once the
+    // session has detached from it (node:internal/http2/core). Holding that proxy and reading
+    // `bytesRead` from it in the session's own 'close' handler is therefore guaranteed to throw
+    // -- by then the detach has already happened.
+    //
+    // It crashed the database outright: an uncaught throw inside a 'close' listener, on the first
+    // connection that ever closed. The process died a few seconds after starting, which read as
+    // "the database is not listening" from every client, and the actual error was one line in a
+    // log that had already scrolled.
+    //
+    // The real socket is reachable underneath and does not have that behaviour: its byte counters
+    // stay readable after close, which is exactly when the final sample is taken.
+    const socket = underlyingSocket(session);
     if (!socket) return;
 
     const id = this._nextConnectionId++;
@@ -122,7 +136,9 @@ class ServiceMetrics extends EventEmitter {
     else this._unattributed.connections += 1;
 
     const close = () => {
-      this._sampleConnection(record);
+      // Guarded as well as sampled safely: a listener that throws here is an uncaught exception
+      // inside an event handler, which is fatal regardless of what the throw was about.
+      try { this._sampleConnection(record); } catch (_) { /* accounting is not worth the process */ }
       this._connections.delete(id);
       if (record.principal) {
         const entry = this._ensure(record.principal);
@@ -189,8 +205,21 @@ class ServiceMetrics extends EventEmitter {
   _sampleConnection(record) {
     const socket = record.socket;
     if (!socket) return;
-    const readNow = socket.bytesRead || 0;
-    const writtenNow = socket.bytesWritten || 0;
+
+    // Reading a socket must never be able to take the database down.
+    //
+    // The underlying socket is used precisely so this does not throw, but a metrics counter is
+    // not worth a process: any future transport that detaches differently would otherwise turn
+    // an accounting detail into an outage. The last known values stay in the record, so a failed
+    // read loses a sample rather than the whole connection's history.
+    let readNow;
+    let writtenNow;
+    try {
+      readNow = socket.bytesRead || 0;
+      writtenNow = socket.bytesWritten || 0;
+    } catch (_) {
+      return;
+    }
     const deltaIn = Math.max(0, readNow - record.bytesIn);
     const deltaOut = Math.max(0, writtenNow - record.bytesOut);
     record.bytesIn = readNow;
@@ -381,6 +410,24 @@ function extractSpiffeId(cert) {
 }
 
 function round2(n) { return Math.round(n * 100) / 100; }
+
+/**
+ * The socket beneath an HTTP/2 session, rather than the session's proxy for it.
+ *
+ * `session.socket` is documented as a proxy that "will throw ERR_HTTP2_SOCKET_UNBOUND" once the
+ * session is destroyed. Every internal Node implementation keeps the real socket on the symbol
+ * below; falling back to the proxy is still better than tracking nothing, because the read path
+ * is guarded either way.
+ */
+function underlyingSocket(session) {
+  for (const symbol of Object.getOwnPropertySymbols(session)) {
+    if (symbol.toString() === 'Symbol(socket)') {
+      const found = session[symbol];
+      if (found) return found;
+    }
+  }
+  try { return session.socket || null; } catch (_) { return null; }
+}
 
 function createServiceMetrics(options) { return new ServiceMetrics(options); }
 

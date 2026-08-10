@@ -239,11 +239,67 @@ class AdmissionGate extends EventEmitter {
    */
   wrapPrincipalResolver(resolvePrincipal) {
     return (peer) => {
-      const principal = resolvePrincipal(peer);
-      this._verifyControlIdentity(principal);
+      let principal;
+      try {
+        principal = resolvePrincipal(peer);
+      } catch (err) {
+        // THE CONTROL PRINCIPAL HAS NO REGISTRY ENTRY, AND MUST NOT NEED ONE.
+        //
+        // The inner resolver answers from the service registry -- the list of applications an
+        // operator registered. The identity provider is not one of them: it is admitted by THIS
+        // gate, which is a different mechanism for a different reason. It is the only peer that
+        // can reach anything while the database is sealed, and its certificate is signed by the
+        // CA that every other principal's certificate descends from.
+        //
+        // Before this, the registry rejected it before the gate ever saw it, and the database
+        // could never be opened at all: the IdP installed the server identity over the control
+        // plane, came back for the mutually authenticated connection that commits it, and was
+        // refused as "not an authorised principal". The hold timer then expired and the database
+        // re-sealed -- forever, on every boot.
+        //
+        // Seeding it into the registry would "fix" it and reintroduce exactly what this design
+        // removes: a second place that decides who the identity provider is, which can disagree
+        // with the first.
+        const control = this._controlPrincipalFromPeer(peer);
+        if (!control) throw err;
+        principal = control;
+      }
+      this._verifyControlIdentity(principal, peer);
       this.commit(principal?.id);
       this.assertAdmits(principal?.id);
       return principal;
+    };
+  }
+
+  /**
+   * Builds the control principal from a peer certificate, or null if this is not it.
+   *
+   * BOTH halves must match, and that is the whole point: the name is policy and lives in this
+   * process's configuration, the SPIFFE ID is a cryptographic claim and lives in a certificate
+   * signed by the CA. Someone who can edit the configuration still cannot become the identity
+   * provider, and someone who can mint a certificate still has to be named here.
+   */
+  _controlPrincipalFromPeer(peer) {
+    if (!peer || peer.securityLevel !== 'mtls' || !peer.certificate) return null;
+    const cn = peer.certificate.subject?.CN || null;
+    if (!cn || cn !== this.controlPrincipal) return null;
+
+    if (this.controlSpiffeId) {
+      // eslint-disable-next-line global-require
+      const spiffe = require('./spiffe');
+      let presented = null;
+      try { presented = spiffe.fromCertificate(peer.certificate); } catch (_) { return null; }
+      if (!presented || presented.uri !== this.controlSpiffeId) return null;
+    }
+
+    // Admin, because this peer is the certificate authority the whole deployment descends from:
+    // a narrower grant would be theatre, not a restriction.
+    return {
+      id: this.controlPrincipal,
+      roles: ['admin'],
+      spiffeId: this.controlSpiffeId || null,
+      permissions: undefined,
+      viaAdmissionGate: true,
     };
   }
 
@@ -277,12 +333,22 @@ class AdmissionGate extends EventEmitter {
    * an attacker who can edit configuration still cannot become the IdP, and one who can mint a
    * certificate still has to be listed.
    */
-  _verifyControlIdentity(principal) {
+  _verifyControlIdentity(principal, peer = null) {
     if (!this.controlSpiffeId) return;
     if (!principal || principal.id !== this.controlPrincipal) return;
     // eslint-disable-next-line global-require
     const spiffe = require('./spiffe');
-    const presented = spiffe.fromCertificate(principal.certificate);
+    // Read from the PEER's certificate, not from the principal.
+    //
+    // `principal.certificate` was read before, and no resolver sets it: the principal is the
+    // answer to "who is this", assembled from an allow-list, and the certificate is the evidence
+    // it was assembled from. So this check saw `undefined`, found no SPIFFE ID, and denied the
+    // control principal every time -- meaning the database could never be opened by anyone.
+    //
+    // The peer is where the certificate actually is, and it is the only thing here that came off
+    // the wire.
+    const certificate = peer?.certificate || principal.certificate || null;
+    const presented = certificate ? spiffe.fromCertificate(certificate) : null;
     if (!presented || presented.uri !== this.controlSpiffeId) {
       throw denial('PERMISSION_DENIED',
         `'${this.controlPrincipal}' must present the SPIFFE ID ${this.controlSpiffeId}, got `

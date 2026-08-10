@@ -55,6 +55,12 @@ jobs:
         if: steps.ssl.outcome == 'success'
         run: node -e "const r=require('./src/ssl-compat').assertSslCompatible(); console.log('@fitfak/ssl', r.version, 'key binding', r.keyMatch); if(!r.keyMatch) process.exit(1);"
 
+      # Chain assembly, verified by openssl rather than by our own parser: producing bytes and
+      # reading them back with the same code proves only self-consistency.
+      - name: Presented certificate chain builds a path
+        if: steps.ssl.outcome == 'success'
+        run: npm run test:chain
+
   transport:
     # The gRPC layer depends on @fitfak/grpc. Until that is published, CI checks out the
     # sibling repository and links it, which also means this job fails loudly if the two

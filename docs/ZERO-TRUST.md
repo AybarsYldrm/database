@@ -1,5 +1,44 @@
 # The sealed database
 
+## The whole thing, in order
+
+Everything in this system takes its identity from the identity provider, and the ordering below
+is not a convention -- it is what makes that true rather than aspirational.
+
+```
+1.  IdP starts            Opens its CA from the local encrypted vault. Asks nobody anything:
+                          the vault is beside it, so there is no network dependency to satisfy.
+
+2.  Database starts       SEALED. No CA, no server certificate anyone would trust, no principals.
+                          It wears an ephemeral self-signed certificate generated at boot and
+                          never written down. Only the control plane is reachable.
+
+3.  Control plane         The IdP proves itself with the shared control secret, bound to the TLS
+                          exporter (RFC 9266), and hands over a server certificate it issued from
+                          its own root, the matching key, and the trust anchors.
+                          -> the database now has a SERVER identity. Still not open.
+
+4.  mTLS, upgraded        The IdP comes back presenting its own CLIENT certificate, issued by the
+                          same root. The database validates it, sees the SPIFFE ID it was told to
+                          expect, and OPENS.
+
+5.  Everyone else         Services enrol: authenticate, receive a SPIFFE identity, upgrade to
+                          mTLS. The database never signs anything -- it is a Registration
+                          Authority and delegates every signature to the IdP.
+
+6.  Steady state          Every connection is mTLS, every identity is a SPIFFE ID in a URI SAN,
+                          every certificate is short-lived and renews itself.
+```
+
+Steps 3 and 4 are separate on purpose, with a hold timer between them. Installing a certificate
+is not the same as proving you can use it: if the IdP stops after step 3, the material is dropped
+and the database re-seals. That is either a deployment that failed halfway or a single message an
+attacker got through, and both want the door shut again.
+
+Neither process requires the other to be running when it starts. The database boots sealed and
+waits; the IdP boots, buffers its writes, and connects in the background. `scripts/run-local-stack.sh`
+brings both up and waits for step 4 to actually happen.
+
 How this database gets an identity, who is allowed to talk to it, and why the order matters.
 
 This document covers the fitdb side. The certificate authority, the short-lived issuance model
@@ -322,6 +361,41 @@ Two ways, and the difference between them is the point.
    when it is, this database is the thing an operator most needs to look at.
 
 The panel displays which of the two is holding the door open, because they are not equivalent.
+
+### A branch application in one call
+
+`joinAsService` is everything `examples/app-client.js` demonstrates, as a supported call:
+
+```js
+const { joinAsServiceWhenReady } = require('@fitfak/database');
+
+const service = await joinAsServiceWhenReady({ serviceName: 'dns-resolver', roles: ['reader', 'writer'] });
+const records = service.db.collection('records');
+```
+
+`examples/app-client.js` is still worth reading to understand what happens — and worth **not**
+copying into an application. It is about 200 lines, every application needed its own copy, and
+every copy is a place for one step to be dropped. The steps that get dropped are predictable, and
+none of them fail in a way that points back at the step:
+
+| Dropped | What it looks like instead |
+|---|---|
+| Persisting the certificate | Every restart enrols again, so the single-shot secret has to become a standing credential. Nothing looks wrong until someone asks why it has been used forty times. |
+| Renewing | Works perfectly for hours, then a TLS handshake failure that never mentions expiry. |
+| Pinning the **root**, not the leaf | Breaks daily — the server certificate is regenerated on every boot, which is the point of the sealed bootstrap. |
+| Retrying while sealed | The application cannot be started before the IdP, because it treats a normal ordering as fatal. |
+
+Two things it deliberately will not do: invent an enrolment secret, or read one from the pairing
+directory. That secret is one service's credential, shown once in the admin panel — a secret
+readable from a shared directory would be one every process on the host could enrol with, and the
+identity model would reduce to "can you read /var/lib/fitfak".
+
+`joinAsService` throws on a sealed database; `joinAsServiceWhenReady` retries. They are separate
+because they mean different things: a one-shot task should exit when misconfigured, a long-running
+service should survive being started first. Only the sealed case is retried — retrying a wrong
+secret would turn a clear failure into a service that never starts and never says why.
+
+A worked version is `examples/branch-service.js`.
 
 ### An ordinary application connecting
 
