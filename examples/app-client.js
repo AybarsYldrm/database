@@ -21,7 +21,7 @@
 // The rest is the same three calls it always was.
 
 const {
-  enroll, resume, connectDatabase, createFitfakSslCsrProvider, spiffe,
+  enroll, resume, connectDatabase, createFitfakSslCsrProvider, spiffe, pairing,
 } = require('..');
 
 const fsp = require('node:fs/promises');
@@ -31,9 +31,9 @@ const path = require('node:path');
 // Configuration
 // ---------------------------------------------------------------------------------------------
 
-const TARGET = process.env.FITFAK_DB_TARGET || 'https://localhost:51572';
 const TRUST_DOMAIN = process.env.FITFAK_TRUST_DOMAIN || 'fitfak.net';
 const SERVICE_NAME = process.env.FITFAK_SERVICE_NAME || 'smtp-service';
+const PAIRING_DIR = process.env.FITFAK_PAIRING_DIR || null;
 
 // Where this service keeps its certificate between restarts.
 //
@@ -46,13 +46,20 @@ const IDENTITY_FILE = path.join(STATE_DIR, 'identity.json');
 // The identity this service will hold. It goes in the URI SAN, not the CN.
 const SPIFFE_ID = spiffe.forService(TRUST_DOMAIN, SERVICE_NAME.replace(/-service$/, '')).uri;
 
-// One of these is required. The CA fingerprint is the better one to carry: it survives a
-// legitimate rotation of the database's server certificate, which a leaf pin does not.
-const CA_FINGERPRINT = process.env.FITFAK_DB_CA_FINGERPRINT || '';
+// The address and the trust anchor.
+//
+// Both are DISCOVERED when the three processes share a host: the database writes where it can be
+// reached, the IdP writes the root certificate everything descends from, and this file reads
+// both. Set the environment variables when they do not share a host — then these values have to
+// travel some other way, and there is nothing here that can invent them.
+//
+// The enrolment secret is not discovered and must not be. It is this ONE service's credential,
+// issued from the admin panel and shown once; a secret readable from a shared directory would be
+// a secret every process on the host could enrol with.
 const ENROLMENT_SECRET = process.env.FITFAK_ENROLMENT_SECRET || '';
 // Once the IdP is up, this is the better path: the service presents a token it already holds
 // rather than a secret pasted into its environment. Same endpoint, different era — see the
-// composite attestor in examples/db-server.js.
+// composite attestor in bin/db-server.js.
 const ACCESS_TOKEN = process.env.FITFAK_ACCESS_TOKEN || '';
 
 // ---------------------------------------------------------------------------------------------
@@ -75,7 +82,32 @@ async function storeIdentity(identity) {
   await fsp.rename(tmp, IDENTITY_FILE);
 }
 
-async function obtainIdentity() {
+/**
+ * Where the database is and what to authenticate it against.
+ *
+ * Sending an enrolment credential to a server you have not authenticated is sending it to
+ * whoever answered on that address — so a missing anchor is a hard stop, not a warning.
+ */
+async function resolveTarget() {
+  const database = await pairing.readDatabase({ dir: PAIRING_DIR });
+  const idp = await pairing.readIdp({ dir: PAIRING_DIR });
+
+  const target = process.env.FITFAK_DB_TARGET || database?.target;
+  if (!target) {
+    throw new Error(
+      'No database address. Set FITFAK_DB_TARGET, or run this on the host where the database '
+      + `writes its pairing file (${pairing.pairingDir(PAIRING_DIR)}).`,
+    );
+  }
+
+  // The ROOT's fingerprint, not the server certificate's. A leaf pin breaks on every legitimate
+  // rotation of the database's server certificate — and that certificate is regenerated on every
+  // boot by design, so a leaf pin here would break daily.
+  const fingerprint = process.env.FITFAK_DB_CA_FINGERPRINT || idp?.rootFingerprint;
+  return { target, fingerprint, discovered: !process.env.FITFAK_DB_TARGET && !!database };
+}
+
+async function obtainIdentity({ target, fingerprint }) {
   const csrProvider = createFitfakSslCsrProvider();
 
   // ---- restart: reuse the certificate we already hold -----------------------------------
@@ -83,7 +115,7 @@ async function obtainIdentity() {
   if (stored) {
     console.log('[app] stored certificate found — resuming, no enrolment credential spent');
     return resume({
-      target: TARGET,
+      target,
       certPem: stored.certPem,
       privateKeyPem: stored.privateKeyPem,
       chainPem: stored.chainPem,
@@ -99,12 +131,13 @@ async function obtainIdentity() {
   }
 
   // ---- first run: enrol -------------------------------------------------------------------
-  if (!CA_FINGERPRINT) {
-    // Sending an enrolment credential to a server you have not authenticated is sending it to
-    // whoever answered on that address.
+  if (!fingerprint) {
     throw new Error(
-      'FITFAK_DB_CA_FINGERPRINT is required on first run. Without it there is no way to '
-      + 'authenticate the database before handing it an enrolment credential.',
+      'No trust anchor on first run. Without one there is no way to authenticate the database '
+      + 'before handing it an enrolment credential, and the credential would go to whoever '
+      + 'answered on that address. The identity provider publishes the root fingerprint to the '
+      + `pairing directory (${pairing.pairingDir(PAIRING_DIR)}) once it has provisioned the `
+      + 'database; until then, pass FITFAK_DB_CA_FINGERPRINT.',
     );
   }
   if (!ENROLMENT_SECRET && !ACCESS_TOKEN) {
@@ -117,12 +150,12 @@ async function obtainIdentity() {
   console.log(`[app] no stored certificate — enrolling as ${SPIFFE_ID}`);
 
   const identity = await enroll({
-    target: TARGET,
+    target,
     serviceName: SERVICE_NAME,
     csrProvider,
     // Pinning the CA rather than shipping the bundle: enough to authenticate the server on
     // first contact, and it survives a legitimate server-certificate rotation.
-    trust: { pinnedFingerprints: [CA_FINGERPRINT] },
+    trust: { pinnedFingerprints: [fingerprint] },
     bootstrap: ACCESS_TOKEN
       ? { token: ACCESS_TOKEN }
       : { secret: Buffer.from(ENROLMENT_SECRET, 'base64') },
@@ -150,9 +183,14 @@ async function obtainIdentity() {
 }
 
 async function main() {
+  const { target, fingerprint, discovered } = await resolveTarget();
+  if (discovered) {
+    console.log(`[app] database found in the pairing directory: ${target}`);
+  }
+
   let identity;
   try {
-    identity = await obtainIdentity();
+    identity = await obtainIdentity({ target, fingerprint });
   } catch (err) {
     // The one failure worth naming, because it is not a bug and not transient: the database is
     // refusing everyone until the identity provider has connected.
@@ -194,7 +232,7 @@ async function main() {
   console.log(`[app] certificate expires ${new Date(identity.notAfter).toISOString()}`);
 
   // ---- the data plane ---------------------------------------------------------------------
-  const handle = await connectDatabase({ target: TARGET, identity });
+  const handle = await connectDatabase({ target, identity });
 
   const who = await handle.whoAmI();
   console.log(`[app] the server sees: ${who.principal} (${who.securityLevel})`);

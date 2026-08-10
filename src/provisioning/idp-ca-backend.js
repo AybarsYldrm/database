@@ -49,6 +49,9 @@ const DEFAULT_TIMEOUT_MS = 5000;
  * @param {object}  [opts.ssl]               @fitfak/ssl, used to decode the CSR locally
  * @param {function}[opts.parseCsr]          full override for CSR decoding
  * @param {function}[opts.fetchImpl]         injectable for tests
+ * @param {function}[opts.credentialsProvider] async () => { issuanceUrl, anchorsUrl?, clientId,
+ *                                           clientSecret } -- resolved per request instead of at
+ *                                           construction. See below for why that is necessary.
  */
 function createIdpCaBackend({
   issuanceUrl,
@@ -57,20 +60,54 @@ function createIdpCaBackend({
   clientSecret,
   spiffePrefix = null,
   trustAnchorsProvider = null,
+  credentialsProvider = null,
   ssl = null,
   parseCsr = null,
   timeoutMs = DEFAULT_TIMEOUT_MS,
   fetchImpl = null,
   logger = null,
 }) {
-  if (!issuanceUrl) throw new Error('fitdb pki: createIdpCaBackend requires an issuanceUrl');
-  if (!clientId || !clientSecret) {
-    throw new Error('fitdb pki: createIdpCaBackend requires clientId and clientSecret; the identity '
-      + 'provider has to know which registration authority is vouching for a request before it '
-      + 'can decide what that authority may vouch for');
+  // Credentials may be late-bound, and in this stack they usually are.
+  //
+  // The database starts before the IdP has ever run. At that moment there is no issuance URL and
+  // no RA client to name, because nothing has issued one — the IdP publishes both when it
+  // provisions this process. Requiring them at construction would mean the database could only be
+  // started SECOND, which is the ordering constraint this whole design removes.
+  //
+  // Nothing is lost by deferring: an enrolment cannot succeed before the IdP exists anyway, so the
+  // first call that needs these values is necessarily after they are available.
+  if (!credentialsProvider) {
+    if (!issuanceUrl) throw new Error('fitdb pki: createIdpCaBackend requires an issuanceUrl');
+    if (!clientId || !clientSecret) {
+      throw new Error('fitdb pki: createIdpCaBackend requires clientId and clientSecret; the identity '
+        + 'provider has to know which registration authority is vouching for a request before it '
+        + 'can decide what that authority may vouch for');
+    }
   }
 
-  const post = fetchImpl || defaultPost({ clientId, clientSecret, timeoutMs });
+  // Resolved once and remembered. Re-reading on every enrolment would turn a certificate request
+  // into a disk read, and these values change only when the IdP is reconfigured — which restarts
+  // this process anyway, because the server identity is reinstalled with them.
+  let resolved = credentialsProvider ? null : { issuanceUrl, anchorsUrl, clientId, clientSecret };
+  let post = fetchImpl || (resolved ? defaultPost({ ...resolved, timeoutMs }) : null);
+
+  async function credentials() {
+    if (resolved) return resolved;
+    const found = await credentialsProvider();
+    if (!found || !found.issuanceUrl || !found.clientId || !found.clientSecret) {
+      throw new Error(
+        'fitdb pki: this database has no registration-authority credentials yet. The identity '
+        + 'provider publishes them when it provisions this process; until it has, no service can '
+        + 'enrol. Start the identity provider, or check that both processes agree on the pairing '
+        + 'directory (FITFAK_PAIRING_DIR).',
+      );
+    }
+    resolved = { anchorsUrl, ...found };
+    if (!fetchImpl) post = defaultPost({ ...resolved, timeoutMs });
+    logger?.info?.(`[pki] registration-authority credentials resolved: ${resolved.clientId} -> ${resolved.issuanceUrl}`);
+    return resolved;
+  }
+
   const prefix = spiffePrefix ? spiffe.parse(spiffePrefix) : null;
 
   // Cached because it is stable and because an enrolment that pays for a second round trip to
@@ -86,12 +123,13 @@ function createIdpCaBackend({
         return { chainPem, fingerprints: chainPem.map(fingerprintOf) };
       }
       if (cachedAnchors) return cachedAnchors;
-      if (!anchorsUrl) {
+      const config = await credentials();
+      if (!config.anchorsUrl) {
         throw new Error('fitdb pki: createIdpCaBackend needs either an anchorsUrl or a '
           + 'trustAnchorsProvider, otherwise an enrolling peer has nothing to validate this '
           + 'server against on its next connection');
       }
-      const response = await post(anchorsUrl, {});
+      const response = await post(config.anchorsUrl, {});
       const chainPem = response.chainPem || [];
       cachedAnchors = { chainPem, fingerprints: chainPem.map(fingerprintOf) };
       return cachedAnchors;
@@ -119,7 +157,8 @@ function createIdpCaBackend({
         }
       }
 
-      const response = await post(issuanceUrl, {
+      const config = await credentials();
+      const response = await post(config.issuanceUrl, {
         csrPem,
         subject: subject || null,
         altNames: altNames || [],
@@ -153,11 +192,12 @@ function createIdpCaBackend({
      * months, and for the case where "wait five minutes" is not an acceptable answer.
      */
     async revoke(serialNumber, reason = 'unspecified') {
-      if (!/\/issue$/.test(issuanceUrl)) {
+      const config = await credentials();
+      if (!/\/issue$/.test(config.issuanceUrl)) {
         throw new Error("fitdb pki: revocation is derived from the issuance URL by replacing a "
-          + `trailing '/issue', and '${issuanceUrl}' does not end in one`);
+          + `trailing '/issue', and '${config.issuanceUrl}' does not end in one`);
       }
-      return post(issuanceUrl.replace(/\/issue$/, '/revoke'), { serialNumber, reason });
+      return post(config.issuanceUrl.replace(/\/issue$/, '/revoke'), { serialNumber, reason });
     },
   };
 }

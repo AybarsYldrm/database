@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>fitdb — giriş</title>
+<!-- Tasarım paketi burada da GÖMÜLÜ, panel.html ile aynı gerekçeyle: bu sayfaya
+     bakma sebebiniz kimlik sağlayıcısının ayakta olmaması olabilir ve o
+     durumda ondan stil çekmek, aracı tam da ihtiyaç duyulduğu anda
+     kullanılamaz kılardı. -->
+<style>
+  :root {
+    --fk-font: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+    --fk-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;
+    --fk-bg: #ffffff;
+    --fk-surface: #ffffff;
+    --fk-surface-2: #f4f4f5;
+    --fk-text: #18181b;
+    --fk-text-muted: #52525b;
+    --fk-text-subtle: #a1a1aa;
+    --fk-border: #e4e4e7;
+    --fk-danger:  #b91c1c;  --fk-danger-bg:  #fef2f2;
+    --fk-success: #15803d;  --fk-success-bg: #f0fdf4;
+    --fk-accent:  #1d4ed8;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fk-bg: #09090b;
+      --fk-surface: #0f0f11;
+      --fk-surface-2: #1c1c1f;
+      --fk-text: #fafafa;
+      --fk-text-muted: #a1a1aa;
+      --fk-text-subtle: #71717a;
+      --fk-border: #27272a;
+      --fk-danger:  #f87171;  --fk-danger-bg:  #450a0a;
+      --fk-success: #4ade80;  --fk-success-bg: #052e16;
+      --fk-accent:  #93c5fd;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    background: var(--fk-bg); color: var(--fk-text); font-family: var(--fk-font); padding: 24px;
+    -webkit-font-smoothing: antialiased;
+  }
+  .card {
+    width: 100%; max-width: 460px; background: var(--fk-surface);
+    border: 1px solid var(--fk-border); border-radius: 12px; overflow: hidden;
+  }
+  .card-head { background: #0a0a0a; color: #fafafa; padding: 26px 28px 22px; }
+  .brand { font-size: 17px; font-weight: 700; letter-spacing: -0.01em; }
+  .brand-sub { font-size: 12px; color: #a1a1aa; margin-top: 3px; font-family: var(--fk-mono); }
+  .card-body { padding: 26px 28px 28px; }
+  h1 { font-size: 15px; margin: 0 0 6px; font-weight: 600; }
+  p { font-size: 13.5px; line-height: 1.6; color: var(--fk-text-muted); margin: 0 0 18px; }
+  .btn {
+    display: block; width: 100%; text-align: center; padding: 11px 16px; border-radius: 8px;
+    border: 1px solid transparent; font-size: 14px; font-weight: 600; cursor: pointer;
+    text-decoration: none; font-family: inherit;
+  }
+  .btn-primary { background: #18181b; color: #fafafa; }
+  @media (prefers-color-scheme: dark) { .btn-primary { background: #fafafa; color: #18181b; } }
+  .btn-primary:hover { opacity: 0.9; }
+  .divider {
+    display: flex; align-items: center; gap: 12px; margin: 22px 0 18px;
+    color: var(--fk-text-subtle); font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em;
+  }
+  .divider::before, .divider::after { content: ''; flex: 1; height: 1px; background: var(--fk-border); }
+  .field { margin-bottom: 12px; }
+  label { display: block; font-size: 12px; font-weight: 600; margin-bottom: 5px; color: var(--fk-text-muted); }
+  input {
+    width: 100%; padding: 10px 12px; border: 1px solid var(--fk-border); border-radius: 8px;
+    background: var(--fk-bg); color: var(--fk-text); font-family: var(--fk-mono); font-size: 13px;
+  }
+  input:focus { outline: 2px solid var(--fk-accent); outline-offset: -1px; }
+  .btn-quiet { background: var(--fk-surface-2); color: var(--fk-text); border-color: var(--fk-border); }
+  .note {
+    font-size: 12px; line-height: 1.6; color: var(--fk-text-subtle);
+    border-top: 1px solid var(--fk-border); margin-top: 22px; padding-top: 16px;
+  }
+  .note code { font-family: var(--fk-mono); font-size: 11.5px; color: var(--fk-text-muted); }
+  .banner {
+    padding: 11px 13px; border-radius: 8px; font-size: 13px; line-height: 1.5; margin-bottom: 18px;
+  }
+  .banner-err { background: var(--fk-danger-bg); color: var(--fk-danger); }
+  .banner-ok  { background: var(--fk-success-bg); color: var(--fk-success); }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+
+<div class="card">
+  <div class="card-head">
+    <div class="brand">fitdb</div>
+    <div class="brand-sub" id="origin">—</div>
+  </div>
+
+  <div class="card-body">
+    <div class="banner banner-err hidden" id="err"></div>
+    <div class="banner banner-ok hidden" id="bye">Oturumunuz kapatıldı.</div>
+
+    <div id="idp-block">
+      <h1>Kimlik sağlayıcısı ile giriş</h1>
+      <p>
+        Bu veritabanının yöneticisi olup olmadığınıza <b id="issuer">kimlik sağlayıcısı</b> karar
+        verir. Burada ayrı bir hesabınız yok — olması, tam da bu mimarinin ortadan kaldırdığı
+        ikinci bir kimlik sistemi olurdu.
+      </p>
+      <a class="btn btn-primary" href="/auth/start">FITFAK ID ile devam et</a>
+    </div>
+
+    <div class="divider" id="divider">veya</div>
+
+    <div id="token-block">
+      <h1>Açılış anahtarı</h1>
+      <p>
+        Kimlik sağlayıcısı ulaşılamıyorsa bu yol açık kalır. Anahtar veritabanı açılırken bir kez
+        yazdırılır ve durum dizinindeki <code>admin-token</code> dosyasında durur.
+      </p>
+      <form method="GET" action="/">
+        <div class="field">
+          <label for="token">Anahtar</label>
+          <input type="password" id="token" name="token" autocomplete="off" spellcheck="false"
+                 placeholder="açılışta yazdırılan değer">
+        </div>
+        <button class="btn btn-quiet" type="submit">Anahtar ile gir</button>
+      </form>
+    </div>
+
+    <div class="note">
+      Bu panel yalnızca yerel adresten erişilebilir. Açılış anahtarı bir parola değildir: sahibi
+      yoktur, süresi takip edilmez ve yalnızca kimlik sağlayıcısının çalışmadığı durum içindir.
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  // Sunucudan gelen değerler JSON değişmezi olarak gömülüyor, tırnak içine metin olarak değil:
+  // ikincisinde hata mesajındaki tek bir tırnak işareti sayfayı bozar ve bozulan yer, bir
+  // saldırganın yazdığı metnin kod olarak çalıştığı yerdir.
+  var idpEnabled = {{IDP_ENABLED}};
+  var signedOut = {{SIGNED_OUT}};
+  var issuer = {{IDP_ISSUER}};
+  var error = {{ERROR}};
+
+  document.getElementById('origin').textContent = location.host;
+
+  if (issuer) {
+    // Hangi kimlik sağlayıcısına gönderildiğinizi görmeden bir düğmeye basmak, kimlik avı
+    // saldırısının tam olarak istediği şeydir.
+    document.getElementById('issuer').textContent = issuer.replace(/^https?:\/\//, '');
+  }
+  if (!idpEnabled) {
+    document.getElementById('idp-block').classList.add('hidden');
+    document.getElementById('divider').classList.add('hidden');
+  }
+  if (error) {
+    var e = document.getElementById('err');
+    e.textContent = error;
+    e.classList.remove('hidden');
+  }
+  if (signedOut) document.getElementById('bye').classList.remove('hidden');
+})();
+</script>
+
+</body>
+</html>

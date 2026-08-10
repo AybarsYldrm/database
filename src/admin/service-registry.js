@@ -107,6 +107,7 @@ class ServiceRegistry extends EventEmitter {
     const service = {
       name: entry.name,
       spiffeId: entry.spiffeId,
+      kind: entry.kind || 'service',
       roles: entry.roles || [],
       altNames: entry.altNames || [],
       maxUses: entry.maxUses ?? 1,
@@ -166,6 +167,11 @@ class ServiceRegistry extends EventEmitter {
     return [...this._services.values()].map((service) => ({
       name: service.name,
       spiffeId: service.spiffeId,
+      // What this principal IS, not just what it is called. It decides the SPIFFE path segment
+      // (`/service/dns-resolver` vs `/app/reports`) and it is how the panel separates
+      // infrastructure from the applications an operator registers day to day. Defaulted rather
+      // than required, so registry files written before this field existed still load.
+      kind: service.kind || 'service',
       roles: service.roles,
       altNames: service.altNames,
       maxUses: service.maxUses,
@@ -213,6 +219,7 @@ class ServiceRegistry extends EventEmitter {
     const service = this._install({
       name,
       spiffeId: identity.uri,
+      kind,
       roles,
       // The SPIFFE ID is always in the SAN list: it is the identity the certificate will
       // actually carry, and the enrolment service refuses a CSR that omits the granted one.

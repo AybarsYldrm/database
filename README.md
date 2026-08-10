@@ -469,7 +469,7 @@ await db.grantAccess('smtp-service', DB_PERMISSIONS.ADMIN);
 ## 6a. Several clients on one server
 
 One server process, several services, all of them connected and writing at once, is the normal
-deployment — see `examples/db-server.js` for a complete one and `npm run test:multi-client` for
+deployment — see `bin/db-server.js` for a complete one and `npm run test:multi-client` for
 the properties it relies on.
 
 Everything below is enforced by the engine, not by convention:

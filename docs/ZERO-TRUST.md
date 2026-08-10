@@ -273,7 +273,55 @@ server.listen(51572, {
 });
 ```
 
-A full, commented version is `examples/db-server.js`.
+The runnable version of all of this is `bin/db-server.js` — the program, not an example of one:
+
+```
+npx fitdb-server            # or: node bin/db-server.js
+```
+
+It contains no application code and nowhere to put any. No service names, no schemas, no seeded
+principals: everything this database serves is registered at runtime, from the admin panel or by
+the identity provider, and lives in state rather than in source. A server file that lists its
+services is a server that must be edited and restarted to gain one — and operators who have to
+restart a database to add a service stop adding services one at a time. They raise `maxUses` on an
+existing credential instead, and a single-shot bootstrap secret quietly becomes a standing key.
+
+### Neither process has to start first
+
+The two used to be wired together by hand: copy the control secret out of the database's stdout,
+invent a registration-authority client id and secret, enter five values on both sides, and get an
+unreadable TLS error when any of them was mistyped.
+
+Now both read and write one directory (`src/pairing.js`):
+
+```
+  <pairing>/database.json     written by the database:  target, control secret, bootstrap fingerprint
+  <pairing>/idp.json          written by the IdP:       issuance URL, RA credentials, panel OAuth
+                                                        client, root certificate
+```
+
+Only the directory is configurable, with `FITFAK_PAIRING_DIR`, and only when the two run as
+different users. The root CA **key** is never written there — the only PKI material in the
+directory is the root's certificate and its fingerprint, both public.
+
+Logically the IdP comes first: it is the certificate authority and this database cannot open
+without it. But neither process requires the other to be running when it starts. The database boots
+sealed and waits; the IdP boots, buffers its writes, and connects in the background. Whichever
+starts first waits for the other.
+
+### Who gets into the admin panel
+
+Two ways, and the difference between them is the point.
+
+1. **The identity provider**, which is the everyday path. The operator clicks through, signs in
+   there with whatever it requires that day, and comes back with an authorization code. The IdP
+   decides who is an administrator; the panel only checks the answer — a `fitdb:admin` scope *and*
+   an admin role, checked separately, because a consent screen can grant the first and must never
+   be able to grant the second.
+2. **The startup token**, which is break-glass. The IdP is a separate process that can be down, and
+   when it is, this database is the thing an operator most needs to look at.
+
+The panel displays which of the two is holding the door open, because they are not equivalent.
 
 ### An ordinary application connecting
 

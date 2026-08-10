@@ -37,6 +37,7 @@ const lazy = {
   // The admin surface pulls in node:http and reads a panel file from disk, so it stays behind a
   // getter like the transport: a process embedding the engine should not pay for it.
   get adminServer() { return require('./src/admin/admin-server'); },
+  get idpAuth() { return require('./src/admin/idp-auth'); },
 };
 
 module.exports = {
@@ -109,4 +110,19 @@ module.exports = {
   // ---- operations ------------------------------------------------------------------------------
   get createAdminServer() { return lazy.adminServer.createAdminServer; },
   get AdminServer() { return lazy.adminServer.AdminServer; },
+  // Signing operators into the admin panel with the identity provider, so the panel is not the one
+  // surface in this stack with its own idea of who an administrator is.
+  get createIdpAuth() { return lazy.idpAuth.createIdpAuth; },
+  get IdpAuth() { return lazy.idpAuth.IdpAuth; },
+
+  // ---- pairing ---------------------------------------------------------------------------------
+  // The directory the database and the identity provider leave each other the values neither can
+  // compute alone. Not lazy: it is a few functions over fs and both processes touch it at boot.
+  pairing: require('./src/pairing'),
+
+  // ---- dependency guard --------------------------------------------------------------------
+  // Verifies the signing library produces certificates that match the CSR's private key. An old
+  // version does not, and the failure only surfaces in a TLS handshake somewhere else entirely.
+  get assertSslCompatible() { return require('./src/ssl-compat').assertSslCompatible; },
+  get SslCompatError() { return require('./src/ssl-compat').SslCompatError; },
 };

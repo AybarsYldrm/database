@@ -32,6 +32,29 @@ jobs:
       # build because the only suite covering it could not load.
       - run: npm run test:zero-trust
 
+      # The signing library, checked out and linked so the guard below runs against the version
+      # this package actually declares. It was unpinned ("*") while the library moved to 2.x,
+      # which is how certificates that do not match their CSR's private key got issued -- a fault
+      # invisible until a TLS handshake somewhere else entirely.
+      # Checked out INSIDE the workspace (actions/checkout refuses a path outside it) under a
+      # dot-prefixed directory, so nothing walking the tree for sources picks it up.
+      - uses: actions/checkout@v4
+        continue-on-error: true
+        id: ssl
+        with:
+          repository: AybarsYldrm/ssl
+          path: .ssl-dep
+
+      - name: Link @fitfak/ssl
+        if: steps.ssl.outcome == 'success'
+        run: |
+          mkdir -p node_modules/@fitfak
+          ln -sfn "$GITHUB_WORKSPACE/.ssl-dep" node_modules/@fitfak/ssl
+
+      - name: Signing library produces certificates that match their key
+        if: steps.ssl.outcome == 'success'
+        run: node -e "const r=require('./src/ssl-compat').assertSslCompatible(); console.log('@fitfak/ssl', r.version, 'key binding', r.keyMatch); if(!r.keyMatch) process.exit(1);"
+
   transport:
     # The gRPC layer depends on @fitfak/grpc. Until that is published, CI checks out the
     # sibling repository and links it, which also means this job fails loudly if the two
