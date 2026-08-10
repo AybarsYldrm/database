@@ -61,7 +61,7 @@ const crypto = require('node:crypto');
 const {
   createDatabaseServer, createSharedSecretAttestor, createRenewalAttestor,
   createCompositeAttestor, createIdpCaBackend, createEphemeralBootstrapIdentity,
-  createLogger, spiffe, pairing,
+  createLogger, spiffe, pairing, assertSslCompatible,
   ServiceRegistry, createServiceMetrics, createAdminServer, createIdpAuth,
 } = require('..');
 
@@ -115,6 +115,15 @@ const statePath = (name) => path.join(STATE_DIR, name);
 // ---------------------------------------------------------------------------------------------
 
 async function main() {
+  // ---- the signing library, before anything is signed with it --------------------------------
+  //
+  // An old @fitfak/ssl produces certificates whose public key does not belong to the CSR's
+  // private key. The certificate looks valid, its chain verifies, and it fails only in a TLS
+  // handshake -- a network hop away from the code that made it, hours later, in another service.
+  // Checking here turns that diagnosis into one startup message.
+  const sslCheck = assertSslCompatible();
+  log.info({ version: sslCheck.version, msg: '@fitfak/ssl verified' });
+
   // ---- the throwaway identity this process wears until the IdP provisions it ------------------
   //
   // This certificate authenticates nobody and is not meant to. The bootstrap exchange is

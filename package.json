@@ -69,7 +69,7 @@
     "@fitfak/grpc": "^2.0.0"
   },
   "peerDependencies": {
-    "@fitfak/ssl": "*"
+    "@fitfak/ssl": "^2.1.0"
   },
   "peerDependenciesMeta": {
     "@fitfak/ssl": {

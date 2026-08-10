@@ -119,4 +119,10 @@ module.exports = {
   // The directory the database and the identity provider leave each other the values neither can
   // compute alone. Not lazy: it is a few functions over fs and both processes touch it at boot.
   pairing: require('./src/pairing'),
+
+  // ---- dependency guard --------------------------------------------------------------------
+  // Verifies the signing library produces certificates that match the CSR's private key. An old
+  // version does not, and the failure only surfaces in a TLS handshake somewhere else entirely.
+  get assertSslCompatible() { return require('./src/ssl-compat').assertSslCompatible; },
+  get SslCompatError() { return require('./src/ssl-compat').SslCompatError; },
 };
