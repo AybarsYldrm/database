@@ -73,11 +73,12 @@ function fakeHttp2Server() {
   };
 }
 
-function request(port, method, pathname, { token = null, body = null, origin = null } = {}) {
+function request(port, method, pathname, { token = null, body = null, origin = null, cookie = null } = {}) {
   return new Promise((resolve, reject) => {
     const payload = body ? JSON.stringify(body) : null;
     const headers = { 'content-type': 'application/json' };
     if (token) headers['x-admin-token'] = token;
+    if (cookie) headers.cookie = cookie;
     if (origin) headers.origin = origin;
     if (payload) headers['content-length'] = Buffer.byteLength(payload);
 
@@ -277,10 +278,27 @@ async function main() {
   check('and offers the break-glass token when there is no identity provider',
     login.text.includes('var idpEnabled = false'));
 
-  const panel = await request(port, 'GET', `/?token=${admin.token}`);
-  check('the panel is served with one', panel.status === 200 && panel.text.includes('<title>fitdb'));
-  check('and sets the token as an HttpOnly cookie',
-    /fitdb_admin=[^;]+;.*HttpOnly/i.test(String(panel.headers['set-cookie'])));
+  // The token moves into a cookie and the URL is dropped by the redirect, so `?token=…` never
+  // stays in the address bar of the page being looked at — where every refresh would re-send it,
+  // and where a screenshot would carry it.
+  const entry = await request(port, 'GET', `/?token=${admin.token}`);
+  check('a correct token redirects to the dashboard',
+    entry.status === 302 && entry.headers.location === '/');
+  check('and sets it as an HttpOnly cookie on the way',
+    /fitdb_admin=[^;]+;.*HttpOnly/i.test(String(entry.headers['set-cookie'])));
+  check('scoped so no other origin can cause it to be sent',
+    /SameSite=Strict/i.test(String(entry.headers['set-cookie'])));
+
+  const cookie = /fitdb_admin=[^;]+/.exec(String(entry.headers['set-cookie']))[0];
+  const panel = await request(port, 'GET', '/', { cookie });
+  check('and the cookie alone then serves the panel',
+    panel.status === 200 && panel.text.includes('<title>fitdb'));
+
+  // A wrong token said out loud. Redirecting silently reads as "the page reloaded", and the
+  // operator pastes the same wrong value again.
+  const wrongEntry = await request(port, 'GET', '/?token=definitely-not-the-token');
+  check('a wrong token comes back with a reason',
+    wrongEntry.status === 302 && decodeURIComponent(wrongEntry.headers.location).includes('admin-token'));
 
   const overview = await request(port, 'GET', '/api/overview', { token: admin.token });
   check('the overview loads', overview.status === 200 && !!overview.json.summary);

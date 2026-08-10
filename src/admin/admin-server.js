@@ -172,10 +172,29 @@ class AdminServer {
       // does not stay in the address bar — the same reasoning as the device-code link in the IdP:
       // a URL ends up in history, in a screenshot, and over someone's shoulder.
       const supplied = url.searchParams.get('token');
-      if (supplied && this._tokenMatches(supplied)) {
+      if (supplied) {
+        if (!this._tokenMatches(supplied)) {
+          // Said out loud rather than silently redirected. A wrong token that lands back on the
+          // sign-in page with no message reads as "the page reloaded", and the operator pastes
+          // the same wrong value again.
+          res.statusCode = 302;
+          res.setHeader('location', '/login?error=' + encodeURIComponent(
+            'Bu açılış anahtarı geçerli değil. Anahtar her açılışta yeniden üretilir; '
+            + 'durum dizinindeki admin-token dosyasına bakın.'));
+          return res.end();
+        }
+        // The token moves into a cookie and the URL is dropped by the redirect, so it does not
+        // stay in the address bar — the same reasoning as the device-code link in the IdP: a URL
+        // ends up in history, in a screenshot, and over someone's shoulder.
+        //
+        // Redirecting rather than rendering here is what makes that true. Serving the panel
+        // directly would leave `?token=…` in the address bar of the page being looked at, and
+        // every later refresh would re-send it.
+        res.statusCode = 302;
         res.setHeader('set-cookie',
           `fitdb_admin=${encodeURIComponent(this.token)}; Path=/; Max-Age=43200; HttpOnly; SameSite=Strict`);
-        return this._servePanel(res);
+        res.setHeader('location', '/');
+        return res.end();
       }
       if (this._session(req)) return this._servePanel(res);
 
@@ -473,23 +492,63 @@ class AdminServer {
 
     const rows = registered.map((service) => ({
       ...service,
+      registered: true,
+      system: false,
       usage: usage.get(service.name) || null,
     }));
 
-    // A principal that has connected but is not in the registry should be visible, not hidden.
-    // In a correctly configured deployment there is exactly one — the identity provider, which
-    // is admitted by the admission gate rather than by the enrolment registry — and anything
-    // else appearing here is worth an operator's attention.
+    // The identity provider is not an application, and the panel must not draw it as one.
+    //
+    // It is admitted by the admission gate rather than by the enrolment registry — a different
+    // mechanism, for a different reason. Every other principal here obtained its certificate by
+    // presenting a credential this database issued; the IdP presents a certificate signed by the
+    // CA that this database's whole trust chain descends from, and it is the only principal that
+    // can reach anything while the database is sealed.
+    //
+    // Listing it beside the applications would invite an operator to treat it like one — to
+    // rotate its credential, disable it, remove it. None of those do what they appear to: it has
+    // no registry entry to rotate, and "removing" it would only mean the row disappears until it
+    // reconnects. Marking it as system is what makes the panel's controls honest.
+    const gate = this.server.gate ? this.server.gate.status() : null;
+    const controlPrincipal = gate ? gate.controlPrincipal : null;
+
     for (const [principal, entry] of usage) {
       if (known.has(principal)) continue;
+      const isControl = principal === controlPrincipal;
       rows.push({
         name: principal,
         spiffeId: entry.spiffeId,
-        roles: [],
+        kind: isControl ? 'system' : 'unknown',
+        system: isControl,
+        roles: isControl ? ['admin'] : [],
         altNames: [],
         registered: false,
         enabled: true,
+        description: isControl
+          ? 'Kimlik sağlayıcısı. Bir uygulama değil, sistemin parçası: bu veritabanını mühürden '
+            + 'çıkaran ve diğer herkesin sertifikasını imzalayan taraf.'
+          : '',
         usage: entry,
+      });
+    }
+
+    // The control principal belongs on the list even when it has never connected — its absence is
+    // the single most important thing this panel can tell an operator, and a row that simply is
+    // not drawn says nothing at all.
+    if (controlPrincipal && !rows.some((row) => row.name === controlPrincipal)) {
+      rows.push({
+        name: controlPrincipal,
+        spiffeId: gate.controlSpiffeId,
+        kind: 'system',
+        system: true,
+        roles: ['admin'],
+        altNames: [],
+        registered: false,
+        enabled: true,
+        connected: false,
+        description: 'Kimlik sağlayıcısı — henüz bağlanmadı. Bağlanana kadar bu veritabanı '
+          + 'mühürlü kalır ve hiçbir uygulama giremez.',
+        usage: null,
       });
     }
     return rows;
