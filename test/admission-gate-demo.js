@@ -213,7 +213,72 @@ async function main() {
     gate.close();
   }
 
-  console.log(`\nOK - admission gate: ${checks} checks passed.`);
+  
+// ---------------------------------------------------------------------------------------------
+console.log('\nX. The control principal needs no registry entry');
+
+{
+  // The identity provider is admitted by THIS gate, not by the service registry -- a different
+  // mechanism for a different reason. Before this worked, the registry rejected it first and the
+  // database could never be opened at all: the IdP installed the server identity, came back for
+  // the mutually authenticated connection that commits it, and was refused as "not an authorised
+  // principal". The hold timer then expired and it re-sealed. Forever, on every boot.
+  const gate = createAdmissionGate({
+    controlPrincipal: 'idp-service',
+    controlSpiffeId: 'spiffe://fitfak.net/service/idp',
+    bootstrapSecret: Buffer.alloc(32, 9),
+    installIdentity: () => {},
+    restoreIdentity: () => {},
+  });
+  gate.provision({ certPem: 'x', privateKeyPem: 'y', chainPem: [], trustAnchorsPem: [] });
+
+  // A resolver that knows nothing -- exactly what an empty registry is, and what bin/db-server.js
+  // starts with now that nothing is seeded.
+  const emptyRegistry = () => { throw new Error("'idp-service' is not an authorised principal on this server"); };
+  const resolve = gate.wrapPrincipalResolver(emptyRegistry);
+
+  // The peer carries the SANs the way Node actually produces them.
+  const idpPeer = {
+    securityLevel: 'mtls',
+    certificate: { subject: { CN: 'idp-service' }, subjectaltname: 'URI:spiffe://fitfak.net/service/idp' },
+  };
+  const principal = resolve(idpPeer);
+  check('the control principal is admitted without a registry entry', principal.id === 'idp-service');
+  check('and it is marked as having come through the gate', principal.viaAdmissionGate === true);
+  check('committing it opens the database', gate.state === 'open');
+
+  // BOTH halves must match. The name is policy and lives in configuration; the SPIFFE ID is a
+  // cryptographic claim and lives in a certificate signed by the CA.
+  const gate2 = createAdmissionGate({
+    controlPrincipal: 'idp-service',
+    controlSpiffeId: 'spiffe://fitfak.net/service/idp',
+    bootstrapSecret: Buffer.alloc(32, 9),
+    installIdentity: () => {},
+    restoreIdentity: () => {},
+  });
+  gate2.provision({ certPem: 'x', privateKeyPem: 'y', chainPem: [], trustAnchorsPem: [] });
+  const resolve2 = gate2.wrapPrincipalResolver(emptyRegistry);
+
+  let threw = false;
+  try {
+    resolve2({ securityLevel: 'mtls', certificate: { subject: { CN: 'idp-service' }, subjectaltname: 'URI:spiffe://fitfak.net/service/attacker' } });
+  } catch (_) { threw = true; }
+  check('right name, wrong SPIFFE ID is refused', threw);
+  check('and the database stays sealed', gate2.state !== 'open');
+
+  threw = false;
+  try {
+    resolve2({ securityLevel: 'mtls', certificate: { subject: { CN: 'someone-else' }, subjectaltname: 'URI:spiffe://fitfak.net/service/idp' } });
+  } catch (_) { threw = true; }
+  check('wrong name is refused even with the right SPIFFE ID', threw);
+
+  // And a peer with no certificate at all cannot become the control principal by asserting it.
+  threw = false;
+  try { resolve2({ securityLevel: 'tls', certificate: null }); } catch (_) { threw = true; }
+  check('an unauthenticated peer is refused', threw);
+}
+
+console.log(`\nOK - admission gate: ${checks} checks passed.`);
 }
 
 main().then(
