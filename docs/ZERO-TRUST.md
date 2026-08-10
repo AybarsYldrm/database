@@ -1,5 +1,44 @@
 # The sealed database
 
+## The whole thing, in order
+
+Everything in this system takes its identity from the identity provider, and the ordering below
+is not a convention -- it is what makes that true rather than aspirational.
+
+```
+1.  IdP starts            Opens its CA from the local encrypted vault. Asks nobody anything:
+                          the vault is beside it, so there is no network dependency to satisfy.
+
+2.  Database starts       SEALED. No CA, no server certificate anyone would trust, no principals.
+                          It wears an ephemeral self-signed certificate generated at boot and
+                          never written down. Only the control plane is reachable.
+
+3.  Control plane         The IdP proves itself with the shared control secret, bound to the TLS
+                          exporter (RFC 9266), and hands over a server certificate it issued from
+                          its own root, the matching key, and the trust anchors.
+                          -> the database now has a SERVER identity. Still not open.
+
+4.  mTLS, upgraded        The IdP comes back presenting its own CLIENT certificate, issued by the
+                          same root. The database validates it, sees the SPIFFE ID it was told to
+                          expect, and OPENS.
+
+5.  Everyone else         Services enrol: authenticate, receive a SPIFFE identity, upgrade to
+                          mTLS. The database never signs anything -- it is a Registration
+                          Authority and delegates every signature to the IdP.
+
+6.  Steady state          Every connection is mTLS, every identity is a SPIFFE ID in a URI SAN,
+                          every certificate is short-lived and renews itself.
+```
+
+Steps 3 and 4 are separate on purpose, with a hold timer between them. Installing a certificate
+is not the same as proving you can use it: if the IdP stops after step 3, the material is dropped
+and the database re-seals. That is either a deployment that failed halfway or a single message an
+attacker got through, and both want the door shut again.
+
+Neither process requires the other to be running when it starts. The database boots sealed and
+waits; the IdP boots, buffers its writes, and connects in the background. `scripts/run-local-stack.sh`
+brings both up and waits for step 4 to actually happen.
+
 How this database gets an identity, who is allowed to talk to it, and why the order matters.
 
 This document covers the fitdb side. The certificate authority, the short-lived issuance model

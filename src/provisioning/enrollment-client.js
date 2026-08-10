@@ -6,6 +6,7 @@ const { GrpcClient } = require('@fitfak/grpc');
 
 const { ENROLMENT_SCHEMAS } = require('./enrollment-service');
 const { computeEnrolmentProof } = require('./attestor');
+const chain = require('./chain');
 
 // The enrolling side of the bootstrap flow, and the thing that makes "connect without a
 // certificate, then connect with one" a supported operation rather than a manual dance:
@@ -205,7 +206,10 @@ async function enroll({
   const chainPem = issued.chainPem && issued.chainPem.length ? issued.chainPem : anchors.chainPem;
   const credentials = {
     key: keyPair.privateKeyPem,
-    cert: [issued.certPem, ...chainPem.slice(0, -1)].join(''),
+    // Presented chain built by READING the certificates, not by dropping the last one. The
+    // positional version silently omitted the intermediate whenever the chain held only that --
+    // which is exactly what the RA fallback produces. See src/provisioning/chain.js.
+    cert: chain.presentationChain(issued.certPem, chainPem),
     // From here on the server is validated against the anchors it just handed us over a
     // channel we had already authenticated, so the upgraded connection is verified properly
     // even if the bootstrap leg was pinned or trust-on-first-use.
@@ -277,7 +281,10 @@ async function resume({
 
   const credentials = {
     key: privateKeyPem,
-    cert: [certPem, ...chainPem.slice(0, -1)].join(''),
+    cert: chain.presentationChain(certPem, chainPem),
+    // Everything in the bundle stays available as an anchor: a superset here can only make
+    // verification succeed where it should, never where it should not, because each candidate
+    // still has to actually sign the path.
     ca: chainPem.join(''),
     rejectUnauthorized: true,
   };
@@ -333,7 +340,7 @@ async function reenroll({ identity, csrProvider, routes = DEFAULT_ENROLMENT_PATH
   return {
     credentials: {
       key: keyPair.privateKeyPem,
-      cert: [issued.certPem, ...chainPem.slice(0, -1)].join(''),
+      cert: chain.presentationChain(issued.certPem, chainPem),
       ca: chainPem.join(''),
       rejectUnauthorized: true,
     },
