@@ -165,6 +165,35 @@ async function main() {
     // The SPIFFE ID must be in the SAN exactly once: omitting it yields a certificate carrying
     // no verifiable identity.
     check('the SPIFFE ID goes in the SAN', /altNames: \[spiffeId, serviceName\]/.test(SOURCE));
+
+    // THE NAME IS THE NAME. This was `serviceName.replace(/-service$/, '')`, and that one regex
+    // broke the invariant the whole single-name registration is built on: the identity provider
+    // registers an application under one name and derives the SPIFFE ID from it INTACT
+    // (spiffe.build(trustDomain, 'service', name)). For any application called
+    // `<something>-service` the IdP granted `spiffe://…/service/smtp-service` while the
+    // application asked for `spiffe://…/service/smtp`, and the enrolment service refuses an
+    // identity other than the one granted -- so enrolment failed outright, with an error about
+    // a SPIFFE mismatch rather than about a suffix being stripped on one side.
+    //
+    // examples/app-client.js defaults to `smtp-service`, so the shipped example was the case
+    // that could not work.
+    // Checked against the CODE, not the prose: the comment above the fix quotes the old
+    // expression verbatim, and a check that cannot tell an explanation from an instruction
+    // would fail on the very commit that fixes the bug.
+    const codeOnly = (text) => text.split('\n').filter((line) => !/^\s*(\/\/|\*|\/\*)/.test(line)).join('\n');
+    check('the service name is not rewritten', !/replace\(\/-service/.test(codeOnly(SOURCE)));
+    check('it is used whole', /spiffe\.forService\(trustDomain, serviceName\)/.test(codeOnly(SOURCE)));
+
+    const { spiffe } = require('..');
+    for (const name of ['smtp-service', 'dns-resolver', 'service']) {
+      // Both sides, derived the way each actually derives it, must agree.
+      const grantedByIdp = spiffe.build('fitfak.net', 'service', name).uri;
+      const askedForByApp = spiffe.forService('fitfak.net', name).uri;
+      check(`'${name}': both sides derive ${grantedByIdp}`, grantedByIdp === askedForByApp);
+    }
+
+    const example = codeOnly(fs.readFileSync(path.join(__dirname, '..', 'examples', 'app-client.js'), 'utf8'));
+    check('the example does not rewrite it either', !/replace\(\/-service/.test(example));
   }
 
   console.log('\n7. Secrets are written the way secrets are written');
