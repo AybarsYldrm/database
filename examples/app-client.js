@@ -44,7 +44,11 @@ const STATE_DIR = process.env.FITFAK_SERVICE_STATE_DIR || path.join(__dirname, '
 const IDENTITY_FILE = path.join(STATE_DIR, 'identity.json');
 
 // The identity this service will hold. It goes in the URI SAN, not the CN.
-const SPIFFE_ID = spiffe.forService(TRUST_DOMAIN, SERVICE_NAME.replace(/-service$/, '')).uri;
+// The name is used WHOLE. Stripping a `-service` suffix here would ask for an identity the
+// identity provider never granted: it registers an application under one name and derives the
+// SPIFFE ID from that name intact, so enrolment would be refused for exactly the name this
+// file uses as its default.
+const SPIFFE_ID = spiffe.forService(TRUST_DOMAIN, SERVICE_NAME).uri;
 
 // The address and the trust anchor.
 //

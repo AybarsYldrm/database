@@ -113,7 +113,23 @@ async function joinAsService({
   // eslint-disable-next-line global-require
   const { enroll, resume, connectDatabase, createFitfakSslCsrProvider, spiffe } = require('..');
 
-  const spiffeId = spiffe.forService(trustDomain, serviceName.replace(/-service$/, '')).uri;
+  // The name is the name. It used to be `serviceName.replace(/-service$/, '')`, and that one
+  // regex broke the invariant the whole registration flow is built on.
+  //
+  // The identity provider registers an application under a SINGLE name, and derives the OAuth
+  // client id, the database service name and the SPIFFE ID from it -- specifically
+  // `spiffe.build(trustDomain, 'service', name)`, with the name intact. Stripping a suffix here
+  // meant that for any application called `<something>-service`, the IdP had granted
+  // `spiffe://…/service/smtp-service` while the application asked for
+  // `spiffe://…/service/smtp`. The enrolment service requires the granted identity to be
+  // present exactly once and refuses a different one, so enrolment failed outright -- and the
+  // error is about a SPIFFE mismatch, which reads like a policy decision rather than a suffix
+  // being quietly removed on one side of the handshake.
+  //
+  // examples/app-client.js defaults to `smtp-service`, so the shipped example was the failing
+  // case. Two systems deriving one identity have to derive it the same way; that is the entire
+  // reason the single-name registration exists.
+  const spiffeId = spiffe.forService(trustDomain, serviceName).uri;
   const csrProvider = createFitfakSslCsrProvider();
 
   // ---- the certificate: reuse it, or enrol once -----------------------------------------------
