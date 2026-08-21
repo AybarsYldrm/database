@@ -176,6 +176,38 @@ function main() {
     check('no positional slice remains', !/chainPem\.slice\(0, ?-1\)/.test(client));
     check('the enrolment path builds it semantically', /chain\.presentationChain\(issued\.certPem/.test(client));
     check('the resume path too', /chain\.presentationChain\(certPem/.test(client));
+
+    // The OTHER half, which nothing checked and nothing used. trustAnchors() was written,
+    // documented and exercised only by section 5 above -- every credential actually built
+    // passed `chainPem.join('')` into Node's `ca`, which IS the trust store. An intermediate
+    // in there is an anchor: path building stops at it, so the root's revocation of it is
+    // never consulted, and the root CRL the IdP publishes for exactly that purpose cannot
+    // reach this peer.
+    check('no caller pins the whole bundle as trust anchors',
+      !/ca: chainPem\.join\(''\)/.test(client));
+    check('the trust store is built from anchors', /chain\.trustAnchors\(/.test(client));
+    const caSites = client.match(/^\s*ca: .*$/gm) || [];
+    check(`every credential's ca goes through anchorsFor (${caSites.length} sites)`,
+      caSites.filter((line) => !line.includes('caPem')).every((line) => line.includes('anchorsFor(')));
+  }
+
+  console.log('\n7. A bundle with no anchor is refused, not accepted quietly');
+
+  {
+    // An empty `ca` with rejectUnauthorized does not fail closed -- Node falls back to its
+    // bundled PUBLIC roots. A private PKI would start validating against the public web's
+    // certificate authorities, which is worse than any of the failures above because it looks
+    // like it is working.
+    const { anchorsFor } = require('../src/provisioning/enrollment-client');
+    if (typeof anchorsFor === 'function') {
+      check('an anchored bundle resolves', anchorsFor([interPem, rootPem], 'test').includes(rootPem.trim()));
+      let threw = null;
+      try { anchorsFor([interPem], 'test'); } catch (e) { threw = e; }
+      check('an anchorless bundle throws', threw && /nothing to anchor trust to/.test(threw.message));
+      check('and says what to supply', threw && /Supply the root certificate/.test(threw.message));
+    } else {
+      check('anchorsFor is exported for testing', false);
+    }
   }
 
   fs.rmSync(DIR, { recursive: true, force: true });

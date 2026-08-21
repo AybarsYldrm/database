@@ -27,6 +27,38 @@ const chain = require('./chain');
 // silent fourth option: the caller supplies the CA bundle out of band, or supplies a
 // fingerprint to pin, or explicitly opts into trust-on-first-use knowing what that means.
 
+/**
+ * The trust store for a peer connection: the self-signed anchors in a bundle, and only those.
+ *
+ * `src/provisioning/chain.js` has said this since it was written -- returning intermediates as
+ * anchors "would validate any chain that happens to pass through them" -- but nothing called
+ * `trustAnchors()`. Every credential built here passed `chainPem.join('')`, the whole bundle,
+ * straight into Node's `ca`, which IS the trust store.
+ *
+ * What that costs is specific. An intermediate sitting in `ca` is an anchor: path building
+ * terminates at it and the root's opinion of it is never consulted. The identity provider
+ * publishes intermediate revocations on the ROOT's CRL exactly so that retiring one invalidates
+ * everything beneath it (see the IdP's crl-service root scope). A peer that has pinned the
+ * intermediate cannot act on that publication -- the revocation is issued, served, and ignored,
+ * which is the same failure the split-CRL work was done to eliminate, one layer further out.
+ *
+ * An empty result is fatal rather than permissive. `rejectUnauthorized` with an empty `ca`
+ * falls back to Node's bundled public roots, so a bundle carrying no anchor would quietly
+ * start validating this private PKI against the public web's certificate authorities.
+ */
+function anchorsFor(chainPem, context) {
+  const anchors = chain.trustAnchors(chainPem);
+  if (!anchors) {
+    throw new Error(
+      `[enrol] the chain for ${context} contains no self-signed certificate, so there is `
+      + 'nothing to anchor trust to. Using the bundle as-is would make its intermediates '
+      + 'anchors -- and an empty ca would silently fall back to the public web roots. '
+      + 'Supply the root certificate alongside the issued chain.',
+    );
+  }
+  return anchors;
+}
+
 const DEFAULT_ENROLMENT_PATHS = {
   getTrustAnchors: '/custom.network.EnrollmentService/GetTrustAnchors',
   enroll: '/custom.network.EnrollmentService/Enroll',
@@ -213,7 +245,13 @@ async function enroll({
     // From here on the server is validated against the anchors it just handed us over a
     // channel we had already authenticated, so the upgraded connection is verified properly
     // even if the bootstrap leg was pinned or trust-on-first-use.
-    ca: chainPem.join(''),
+    //
+    // ANCHORS ONLY -- not the whole bundle. `ca` is the trust store, and an intermediate
+    // placed in it becomes a trust anchor in its own right: path building stops there, so the
+    // root's opinion of that intermediate is never consulted. The IdP publishes intermediate
+    // revocations on the ROOT's CRL precisely so that retiring one drops everything beneath it;
+    // pinning the intermediate here is what makes that publication unable to reach us.
+    ca: anchorsFor(chainPem, target),
     rejectUnauthorized: true,
   };
 
@@ -282,10 +320,10 @@ async function resume({
   const credentials = {
     key: privateKeyPem,
     cert: chain.presentationChain(certPem, chainPem),
-    // Everything in the bundle stays available as an anchor: a superset here can only make
-    // verification succeed where it should, never where it should not, because each candidate
-    // still has to actually sign the path.
-    ca: chainPem.join(''),
+    // Anchors only. The bundle's intermediates are presented above, where they belong; putting
+    // them here as well would make each of them a trust anchor, and a chain that stops at an
+    // intermediate is never checked against the root that issued it.
+    ca: anchorsFor(chainPem, target),
     rejectUnauthorized: true,
   };
 
@@ -341,7 +379,7 @@ async function reenroll({ identity, csrProvider, routes = DEFAULT_ENROLMENT_PATH
     credentials: {
       key: keyPair.privateKeyPem,
       cert: chain.presentationChain(issued.certPem, chainPem),
-      ca: chainPem.join(''),
+      ca: anchorsFor(chainPem, `renewal for '${identity.principal}'`),
       rejectUnauthorized: true,
     },
     certPem: issued.certPem,
@@ -391,4 +429,4 @@ function normalizeFingerprint(value) {
   return String(value || '').replace(/:/g, '').toLowerCase();
 }
 
-module.exports = { enroll, resume, reenroll, ManagedIdentity, TrustError, DEFAULT_ENROLMENT_PATHS };
+module.exports = { enroll, resume, reenroll, ManagedIdentity, TrustError, DEFAULT_ENROLMENT_PATHS, anchorsFor };
