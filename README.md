@@ -212,8 +212,10 @@ bootstrapping IdP, an IdP-issued workload token and an ordinary renewal.
 
 ## 2. Using the database
 
-The remote API mirrors the embedded one, so code moves between them by changing how the handle
-is obtained and nothing else.
+The remote API mirrors the embedded one *by method name*, so code moves between them by
+changing how the handle is obtained -- with the exceptions in
+[What the two handles do not share](#what-the-two-handles-do-not-share) below, which are worth
+reading before writing anything that has to run over both.
 
 ```js
 const db = await handle.openDatabase({ dbId, clientSecret });
@@ -238,11 +240,62 @@ server-side. Losing it means losing the data.
 
 **int64 and ids.** JSON has no int64, and every Snowflake id is above 2^53, so `JSON.parse`
 would silently round them — insert a record, read it back, get a *different id*. Ids and int64
-fields therefore cross the wire as strings and are coerced back by schema type. A JSON number
-that has already lost precision is rejected rather than stored corrupted.
+fields therefore cross the wire as strings. On the way *in* they are coerced back by schema
+type, and a JSON number that has already lost precision is rejected rather than stored
+corrupted. On the way *out* they stay strings in the client's hands — see
+[What the two handles do not share](#what-the-two-handles-do-not-share).
 
 **Optimistic concurrency.** `update(id, patch, { expectedVersion })` returns `ABORTED` if the
 record moved. Without it, two concurrent read-modify-write callers silently lose one write.
+
+### What the two handles do not share
+
+The method names match. Several of the values behind them do not, and none of the differences
+raises an error:
+
+| | embedded `Collection` | remote `RemoteCollection` |
+|---|---|---|
+| `int64` / `uint64` | **BigInt** | **decimal string** |
+| `bytes` | **Buffer** | **base64 string** |
+| `update()` | the record | the version number |
+| `count()` | synchronous number | `Promise<number>` |
+| `find()` | no `limit` option | takes `{ limit }` |
+| `generateId()` | present | **absent** (the server assigns ids) |
+| `scan()` | async generator, no options | async generator, `{ pageSize }` |
+| `scanPage(afterId, limit)` | `{ records, nextCursor }` | `{ records, nextCursor }` |
+
+The int64 row is the expensive one, because every counter a caller keeps -- a byte total, a
+timestamp, a version -- gets arithmetic done to it:
+
+```
+embedded:   1024n + 512  -> TypeError    loud, found in a minute
+remote:    "1024" + 512  -> "1024512"    silent, found in production
+```
+
+The second throws nothing, logs nothing, and passes every test written against the embedded
+engine. `@fitfak/workspace` hit exactly this: quota accounting that was correct on the
+embedded driver and doubled a user's used bytes over gRPC.
+
+This asymmetry is deliberate on the write path and incidental on the read path. Writes are
+coerced by schema type on arrival (`coerceRecord`), which is what keeps a Snowflake id from
+being rounded by `JSON.parse`. Reads are not: `RemoteCollection#get()` and friends are a bare
+`JSON.parse` of what the server serialised, so an `int64` that left as a BigInt arrives as the
+string the wire carried. Making reads symmetrical would mean coercing client-side against a
+cached schema -- doable, but it changes the return type of every read for every deployed
+client, the IdP's `grpc-db-adapter` included, so it is documented rather than changed.
+
+`scan()` deserves its own note, because it reads as though it agrees when it does not quite:
+`Collection#scan()` is declared `scan() { return this.storage.scan(); }` -- no `async`, and it
+looks like it hands back an iterator. It hands back an *async* generator, so `for (const x of
+scan())` throws `not iterable` on both classes, not just the remote one.
+
+**If a caller has to run over either handle:** iterate with `scanPage(afterId, limit)`, which
+has the same signature and the same `{ records, nextCursor }` return on both and is paginated,
+which the remote side needs anyway; and normalise `int64` and `bytes` once at the boundary
+rather than at each call site. `@fitfak/workspace` does this in a single adapter
+(`EngineCollection`). `test/collection-surface-demo.js` pins every row of the table above
+against the real engine and the real wire codec, so a change to either side fails a test
+instead of a deployment.
 
 ### Schema evolution
 
